@@ -71,6 +71,87 @@ func (a *ackTracker) mark() uint64 {
 	return a.low
 }
 
+// ageTracker approximates how long the oldest unflushed record has been
+// waiting. It keeps an ordered queue of (lsn, time) marks, each meaning "every
+// record up to lsn was accepted no later than time". Marks are coalesced so the
+// queue stays small; the coarsening only ever overstates an age, and only for
+// records behind the head — the head, which is what OldestAge reports, keeps
+// the resolution it was recorded with.
+//
+// A single transition-based timestamp is not enough here: it measures time
+// since the backlog was last empty, so under sustained load it grows without
+// bound and BlockThenDropOldest would shed fresh records immediately.
+type ageTracker struct {
+	mu    sync.Mutex
+	marks []ageMark
+}
+
+type ageMark struct {
+	lsn uint64 // highest LSN this mark covers
+	at  int64  // unix nanos; no covered record was accepted before this
+}
+
+const (
+	ageGranularity = int64(100 * time.Millisecond)
+	ageMaxMarks    = 512
+)
+
+// note records that every LSN up to lsn was accepted by now.
+func (a *ageTracker) note(lsn uint64, now int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n := len(a.marks); n > 0 {
+		if lsn <= a.marks[n-1].lsn {
+			return
+		}
+		if now-a.marks[n-1].at < ageGranularity {
+			// Extend the newest mark. Its older timestamp can only overstate
+			// the age of the absorbed records, and by less than the granularity.
+			a.marks[n-1].lsn = lsn
+			return
+		}
+	}
+	if len(a.marks) >= ageMaxMarks {
+		// Halve the resolution by merging adjacent pairs, keeping each pair's
+		// earlier timestamp so no age is ever understated.
+		k := 0
+		for i := 0; i < len(a.marks); i += 2 {
+			m := a.marks[i]
+			if i+1 < len(a.marks) {
+				m.lsn = a.marks[i+1].lsn
+			}
+			a.marks[k] = m
+			k++
+		}
+		a.marks = a.marks[:k]
+	}
+	a.marks = append(a.marks, ageMark{lsn: lsn, at: now})
+}
+
+// trim drops marks wholly covered by the low-water mark.
+func (a *ageTracker) trim(mark uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	i := 0
+	for i < len(a.marks) && a.marks[i].lsn <= mark {
+		i++
+	}
+	if i > 0 {
+		a.marks = append(a.marks[:0], a.marks[i:]...)
+	}
+}
+
+// oldest returns the age of the oldest record not yet acknowledged, zero when
+// nothing is pending.
+func (a *ageTracker) oldest(now int64) time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.marks) == 0 {
+		return 0
+	}
+	return time.Duration(now - a.marks[0].at)
+}
+
 // Backoff describes the delay between flush attempts.
 type Backoff struct {
 	Initial time.Duration // delay before the second attempt; default 100ms

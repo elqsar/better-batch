@@ -212,7 +212,8 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 
 // complete marks an LSN range as handled and gives its capacity back.
 func (b *Buffer[T]) complete(from, to uint64, count, bytes int64) {
-	b.acks.ack(from, to)
+	mark := b.acks.ack(from, to)
+	b.ages.trim(mark)
 	b.release(count, bytes)
 	b.progress.signal()
 }
@@ -376,10 +377,7 @@ type Stats struct {
 
 // Stats returns a snapshot of the buffer's counters.
 func (b *Buffer[T]) Stats() Stats {
-	var age time.Duration
-	if at := b.oldestAt.Load(); at != 0 {
-		age = time.Since(time.Unix(0, at))
-	}
+	age := b.ages.oldest(time.Now().UnixNano())
 	return Stats{
 		Written:        b.counters.written.Load(),
 		Flushed:        b.counters.flushed.Load(),

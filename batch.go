@@ -52,7 +52,7 @@ type Buffer[T any] struct {
 	// the backpressure policy are measured against.
 	pendingRecords atomic.Int64
 	pendingBytes   atomic.Int64
-	oldestAt       atomic.Int64 // unix nanos of the oldest unflushed write, 0 if none
+	ages           ageTracker // age of the oldest unflushed record
 	sinkFailures   atomic.Int64
 
 	// floor is the LSN below which records have been abandoned by DropOldest.
@@ -189,21 +189,25 @@ func (b *Buffer[T]) countBacklog(from uint64) error {
 	}
 	defer r.Close()
 	var records, bytes int64
+	var last uint64
 	for {
-		_, payload, err := r.Next()
+		lsn, payload, err := r.Next()
 		if errors.Is(err, wal.ErrNoData) {
 			break
 		}
 		if err != nil {
 			return err
 		}
+		last = lsn
 		records++
 		bytes += int64(len(payload))
 	}
 	b.pendingRecords.Store(records)
 	b.pendingBytes.Store(bytes)
 	if records > 0 {
-		b.oldestAt.Store(time.Now().UnixNano())
+		// The true write times predate this process; dating the inherited
+		// backlog from Open is the conservative choice available.
+		b.ages.note(last, time.Now().UnixNano())
 	}
 	return nil
 }
@@ -267,7 +271,7 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 		}
 		switch err = b.log.Await(ctx, c); {
 		case err == nil:
-			b.accept(n, size)
+			b.accept(c.Last, n, size)
 			return nil
 		case errors.Is(err, wal.ErrPending):
 			// ctx expired with the commit round still in flight. The records are
@@ -358,11 +362,12 @@ func (b *Buffer[T]) reserve(n, size int64) bool {
 	return true
 }
 
-// accept records a batch that reached the log. Its capacity was reserved before
-// the append and stays held until the flusher delivers the records.
-func (b *Buffer[T]) accept(n, size int64) {
+// accept records a batch that reached the log as LSNs up to last. Its capacity
+// was reserved before the append and stays held until the flusher delivers the
+// records.
+func (b *Buffer[T]) accept(last uint64, n, size int64) {
 	b.wrote(int(n), int(size))
-	b.oldestAt.CompareAndSwap(0, time.Now().UnixNano())
+	b.ages.note(last, time.Now().UnixNano())
 	b.nudge()
 }
 
@@ -380,14 +385,12 @@ func (b *Buffer[T]) settle(c wal.Commit, n, size int64) {
 			b.release(n, size) // rolled back: the records never existed
 			return
 		}
-		b.accept(n, size)
+		b.accept(c.Last, n, size)
 	})
 }
 
 func (b *Buffer[T]) release(n, size int64) {
-	if b.pendingRecords.Add(-n) == 0 {
-		b.oldestAt.Store(0)
-	}
+	b.pendingRecords.Add(-n)
 	b.pendingBytes.Add(-size)
 	b.space.signal()
 }
@@ -461,10 +464,7 @@ func (b *Buffer[T]) raiseFloor(to uint64) {
 }
 
 func (b *Buffer[T]) state(attempt int) State {
-	var age time.Duration
-	if at := b.oldestAt.Load(); at != 0 {
-		age = time.Since(time.Unix(0, at))
-	}
+	age := b.ages.oldest(time.Now().UnixNano())
 	return State{
 		Records:      b.pendingRecords.Load(),
 		Bytes:        b.pendingBytes.Load(),

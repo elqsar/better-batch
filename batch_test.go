@@ -708,3 +708,66 @@ func TestRepeatedCloseReturnsFirstError(t *testing.T) {
 		t.Fatalf("second Close = %v, want the first error %v", again, first)
 	}
 }
+
+func TestOldestAgeReflectsDeliveryProgress(t *testing.T) {
+	sink := &recorder{}
+	sink.delay.Store(int64(3 * time.Millisecond)) // keep the backlog nonempty
+	b := openBuf(t, t.TempDir(), sink, fast()...)
+	ctx := context.Background()
+
+	start := time.Now()
+	for time.Since(start) < 600*time.Millisecond {
+		if err := b.Write(ctx, "x"); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The backlog was never empty, but records kept flushing, so the oldest
+	// pending record is recent. Measuring "time since the backlog was last
+	// empty" would report ~600ms here.
+	if age := b.Stats().OldestAge; age > 300*time.Millisecond {
+		t.Fatalf("OldestAge = %v under continuous load; the oldest pending record is far younger", age)
+	}
+	if err := b.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestAgeTrackerCoalescesAndTrims(t *testing.T) {
+	var a ageTracker
+	base := time.Now().UnixNano()
+	// Far-apart marks: one entry each.
+	for i := 1; i <= 4; i++ {
+		a.note(uint64(i*10), base+int64(i)*ageGranularity)
+	}
+	now := base + 10*ageGranularity
+	if got, want := a.oldest(now), time.Duration(9*ageGranularity); got != want {
+		t.Fatalf("oldest = %v, want %v", got, want)
+	}
+	a.trim(10)
+	if got, want := a.oldest(now), time.Duration(8*ageGranularity); got != want {
+		t.Fatalf("oldest after trim(10) = %v, want %v", got, want)
+	}
+	a.trim(15) // mid-mark: the covering mark must survive
+	if got, want := a.oldest(now), time.Duration(8*ageGranularity); got != want {
+		t.Fatalf("oldest after trim(15) = %v, want %v", got, want)
+	}
+	a.trim(40)
+	if got := a.oldest(now); got != 0 {
+		t.Fatalf("oldest after trimming everything = %v, want 0", got)
+	}
+
+	// Overflow compacts instead of growing without bound, and never
+	// understates the head's age.
+	a = ageTracker{}
+	for i := range ageMaxMarks * 3 {
+		a.note(uint64(i+1), base+int64(i)*ageGranularity)
+	}
+	if len(a.marks) > ageMaxMarks {
+		t.Fatalf("tracker grew to %d marks, cap is %d", len(a.marks), ageMaxMarks)
+	}
+	end := base + int64(ageMaxMarks*3)*ageGranularity
+	if got, want := a.oldest(end), time.Duration(end-base); got != want {
+		t.Fatalf("oldest after compaction = %v, want %v", got, want)
+	}
+}
