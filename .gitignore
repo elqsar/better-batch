@@ -1,0 +1,13 @@
+# Binaries and test artifacts
+*.test
+*.out
+*.prof
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local working notes, not published
+idea.md
+progress.md
