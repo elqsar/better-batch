@@ -271,7 +271,7 @@ func TestRecoverFromTornTail(t *testing.T) {
 	}
 }
 
-func TestBitFlipStopsRecoveryAtTheDamage(t *testing.T) {
+func TestBitFlipInsideTheLogIsRejected(t *testing.T) {
 	dir := t.TempDir()
 	l, err := Open(dir, Options{SyncMode: SyncAlways})
 	if err != nil {
@@ -302,10 +302,10 @@ func TestBitFlipStopsRecoveryAtTheDamage(t *testing.T) {
 	}
 	f.Close()
 
-	l2 := open(t, dir, Options{SyncMode: SyncAlways})
-	_, payloads := readAll(t, l2, 0)
-	if len(payloads) != 10 {
-		t.Fatalf("recovered %d records, want the 10 that precede the corruption", len(payloads))
+	// Records 12-20 are intact and were acknowledged as durable, so this must
+	// not be classified as a torn tail and silently truncated away.
+	if _, err := Open(dir, Options{SyncMode: SyncAlways}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Open over interior corruption = %v, want ErrCorrupt", err)
 	}
 }
 

@@ -524,9 +524,13 @@ wedging the pipeline behind it.
 ## Operational notes
 
 - **One writer per directory**, enforced with a lock file. A second `Open` fails.
-- **Recovery** scans and checksum-verifies every segment on open. A partial record at the
-  tail is expected after a crash and is truncated; damage anywhere earlier is an error,
-  because the implicit LSN numbering cannot be reconstructed across a hole.
+- **Recovery** scans and checksum-verifies every segment on open. A bad record that
+  reaches the end of the log is a torn tail — expected after a crash — and is truncated.
+  A bad record with intact records after it is interior corruption and fails `Open`,
+  because truncating there would silently discard durable records and the implicit LSN
+  numbering cannot be reconstructed across a hole. The one blind spot is a corrupted
+  length field in the final record's header: the next record boundary is unrecoverable,
+  so it is indistinguishable from a torn header and is truncated.
 - **Crash replay** starts from the last checkpoint, so `WithCheckpointInterval` sets how
   much gets re-delivered. Duplicates are the contract, not a bug. The checkpoint is fsynced
   while `SyncNever` records are not, so it can survive a machine crash that the log tail did

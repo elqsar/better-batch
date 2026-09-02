@@ -66,8 +66,11 @@ func createSegment(dir string, baseLSN uint64) (*segment, error) {
 // scanSegment reads a segment from the start, verifying every record, and
 // reports how many complete records it holds and where the last one ends.
 //
-// A partial or corrupt record at the tail is expected after a crash and is
-// reported via truncated rather than as an error; only I/O failures are errors.
+// A bad record that reaches the end of the file is a torn tail — expected
+// after a crash and reported via truncated rather than as an error. A bad
+// record with intact data after it cannot be a tear: it is interior corruption,
+// and silently truncating there would discard durable records the writer was
+// told were safe, so it is reported as ErrCorrupt instead.
 func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, truncated bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -99,8 +102,10 @@ func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, tru
 		}
 		length, crc := decodeHeader(hdr)
 		if length > uint32(maxRecordBytes) {
-			// Only a corrupt header can produce this, so treat the rest of the
-			// file as lost.
+			// The length field itself is corrupt, so the next record boundary is
+			// unrecoverable either way: whatever follows cannot be re-framed.
+			// This is indistinguishable from a torn header, so it stays a
+			// truncation rather than an error.
 			return count, good, true, nil
 		}
 		if cap(payload) < int(length) {
@@ -114,6 +119,10 @@ func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, tru
 			return 0, 0, false, err
 		}
 		if checksum(length, payload) != crc {
+			if end := good + recordSize(int(length)); end < total {
+				return 0, 0, false, fmt.Errorf("%w: %s: record at offset %d fails its checksum with %d intact bytes after it",
+					ErrCorrupt, path, good, total-end)
+			}
 			return count, good, true, nil
 		}
 		count++
