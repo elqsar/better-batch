@@ -370,15 +370,13 @@ func (b *Buffer[T]) accept(n, size int64) {
 // releasing that one keeps the counter above zero and makes Close wait for the
 // outcome. The wait is bounded by one commit round.
 func (b *Buffer[T]) settle(c wal.Commit, n, size int64) {
-	b.writers.Add(1)
-	go func() {
-		defer b.writers.Done()
+	b.writers.Go(func() {
 		if err := b.log.Await(context.Background(), c); err != nil {
 			b.release(n, size) // rolled back: the records never existed
 			return
 		}
 		b.accept(n, size)
-	}()
+	})
 }
 
 func (b *Buffer[T]) release(n, size int64) {

@@ -134,12 +134,10 @@ func (b *Buffer[T]) dispatch(p pending[T]) bool {
 	case <-b.abort:
 		return false // leave the range unacknowledged; it replays on the next open
 	}
-	b.deliveries.Add(1)
-	go func() {
-		defer b.deliveries.Done()
+	b.deliveries.Go(func() {
 		defer func() { <-b.sem }()
 		b.deliver(batch, p)
-	}()
+	})
 	return true
 }
 

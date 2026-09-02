@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -184,7 +184,7 @@ func (l *Log) recover() error {
 			bases = append(bases, base)
 		}
 	}
-	sort.Slice(bases, func(i, j int) bool { return bases[i] < bases[j] })
+	slices.Sort(bases)
 
 	for i, base := range bases {
 		path := filepath.Join(l.dir, segmentName(base))
