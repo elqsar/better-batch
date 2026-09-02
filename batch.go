@@ -87,9 +87,14 @@ type Buffer[T any] struct {
 	deliverCancel context.CancelFunc
 
 	closeOnce sync.Once
+	closeErr  error // set inside closeOnce; every Close returns it
 	lastCP    atomic.Uint64
 	fatalErr  atomic.Pointer[error]
 	cpErr     atomic.Pointer[error]
+
+	// forceFlush makes the flusher dispatch a partial batch on its next wake,
+	// so Flush is not left waiting out the flush interval.
+	forceFlush atomic.Bool
 }
 
 // Open creates or reopens a buffer in dir. Any records left over from a previous

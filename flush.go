@@ -79,6 +79,12 @@ func (b *Buffer[T]) flusher(from uint64) {
 			nbytes += size
 		}
 
+		// Flush wants everything out now; treat the interval as elapsed rather
+		// than leaving a partial batch to wait out the ticker.
+		if b.forceFlush.Swap(false) {
+			expired = true
+		}
+
 		full := len(records) >= b.cfg.flushRecords || nbytes >= int64(b.cfg.flushBytes)
 		if len(records) > 0 && (full || expired || draining) {
 			if !b.dispatch(pending[T]{
@@ -241,11 +247,14 @@ func (b *Buffer[T]) persist() {
 		b.noteRetryable(fmt.Errorf("batch: write checkpoint: %w", err))
 		return
 	}
-	b.lastCP.Store(low)
 	if err := b.log.Truncate(low + 1); err != nil {
 		b.noteRetryable(fmt.Errorf("batch: truncate log: %w", err))
 		return
 	}
+	// lastCP advances only once truncation has succeeded too. Rewriting the
+	// checkpoint on a retry is idempotent, and leaving lastCP behind is what
+	// makes the next tick retry a failed truncation instead of skipping it.
+	b.lastCP.Store(low)
 	b.clearRetryable()
 	if f := b.cfg.observer.OnCheckpoint; f != nil {
 		f(low)
@@ -256,8 +265,8 @@ func (b *Buffer[T]) persist() {
 }
 
 // Flush waits until everything written before the call has been accepted by the
-// sink. It does not force a batch to be smaller than configured; it only stops
-// the flusher waiting out its interval.
+// sink. A partial batch is dispatched immediately rather than waiting out the
+// flush interval.
 func (b *Buffer[T]) Flush(ctx context.Context) error {
 	target := b.log.DurableLSN()
 	for {
@@ -268,6 +277,7 @@ func (b *Buffer[T]) Flush(ctx context.Context) error {
 		if err := b.err(); err != nil {
 			return err
 		}
+		b.forceFlush.Store(true)
 		b.nudge()
 		select {
 		case <-waiting:
@@ -284,7 +294,6 @@ func (b *Buffer[T]) Flush(ctx context.Context) error {
 // lost: unacknowledged records stay in the log and are replayed on the next
 // Open. A sink that ignores its context can still stall shutdown.
 func (b *Buffer[T]) Close(ctx context.Context) error {
-	var err error
 	b.closeOnce.Do(func() {
 		b.mu.Lock()
 		b.sealed = true
@@ -322,15 +331,18 @@ func (b *Buffer[T]) Close(ctx context.Context) error {
 		<-b.cpDone
 		b.persist()
 
-		err = b.log.Close()
+		err := b.log.Close()
 		if err == nil && timedOut {
 			err = ctx.Err()
 		}
 		if ferr := b.err(); err == nil && ferr != nil {
 			err = ferr
 		}
+		b.closeErr = err
 	})
-	return err
+	// closeOnce.Do happens-before every later Do return, so closeErr is safe to
+	// read here and repeated calls report the first outcome instead of nil.
+	return b.closeErr
 }
 
 // Stats is a point-in-time view of the buffer, suitable for exporting as

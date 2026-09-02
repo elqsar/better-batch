@@ -667,3 +667,44 @@ func TestAckTrackerLowWaterMark(t *testing.T) {
 		t.Fatalf("mark = %d, want 40", got)
 	}
 }
+
+func TestFlushForcesPartialBatch(t *testing.T) {
+	sink := &recorder{}
+	// A partial batch would otherwise wait an hour for the flush interval.
+	b := openBuf(t, t.TempDir(), sink, fast(WithFlush(1000, 1<<20, time.Hour))...)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if err := b.Write(ctx, fmt.Sprintf("r%d", i)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush did not force the partial batch out: %v", err)
+	}
+	if got := sink.seen(); len(got) != 3 {
+		t.Fatalf("sink saw %d records after Flush, want 3", len(got))
+	}
+	if err := b.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestRepeatedCloseReturnsFirstError(t *testing.T) {
+	sink := &recorder{}
+	sink.failAll.Store(true) // nothing ever drains
+	b := openBuf(t, t.TempDir(), sink, fast()...)
+	if err := b.Write(context.Background(), "stuck"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	first := b.Close(ctx)
+	if first == nil {
+		t.Fatal("Close with a failing sink and expired context returned nil")
+	}
+	if again := b.Close(context.Background()); !errors.Is(again, first) {
+		t.Fatalf("second Close = %v, want the first error %v", again, first)
+	}
+}

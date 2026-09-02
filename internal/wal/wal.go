@@ -564,20 +564,34 @@ func (l *Log) Truncate(upto uint64) error {
 		}
 		drop++
 	}
-	removed := append([]*segment(nil), l.segs[:drop]...)
-	l.segs = l.segs[drop:]
+	doomed := l.segs[:drop]
+	l.mu.Unlock()
+
+	if len(doomed) == 0 {
+		return nil
+	}
+	// Files go first: a segment leaves the in-memory list only once its file is
+	// gone, so a failed removal is retried by the next Truncate instead of
+	// leaving an orphan on disk until the next Open.
+	removed := 0
+	var rerr error
+	for _, s := range doomed {
+		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+			rerr = err
+			break
+		}
+		removed++
+	}
+
+	l.mu.Lock()
+	l.segs = l.segs[removed:]
 	if len(l.segs) > 0 {
 		l.firstLSN = l.segs[0].baseLSN
 	}
 	l.mu.Unlock()
 
-	if len(removed) == 0 {
-		return nil
-	}
-	for _, s := range removed {
-		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
+	if rerr != nil {
+		return rerr
 	}
 	return syncDir(l.dir)
 }

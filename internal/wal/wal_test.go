@@ -676,3 +676,43 @@ func TestRepeatedCommitFailuresStayConsistent(t *testing.T) {
 		}
 	}
 }
+
+func TestTruncateRetriesAfterRemoveFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	l := open(t, dir, Options{MaxSegmentBytes: 64})
+	for i := 0; i < 20; i++ {
+		if _, err := l.Append(context.Background(), payload(i)); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	err := l.Truncate(15)
+	if err == nil {
+		os.Chmod(dir, 0o755)
+		t.Fatal("Truncate succeeded despite an unwritable directory")
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	before, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err := l.Truncate(15); err != nil {
+		t.Fatalf("Truncate retry: %v", err)
+	}
+	after, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	if len(after) >= len(before) {
+		t.Fatalf("retry removed nothing: %d segments before, %d after", len(before), len(after))
+	}
+
+	// The surviving records must still read back.
+	lsns, _ := readAll(t, l, 15)
+	if len(lsns) == 0 || lsns[0] != 15 {
+		t.Fatalf("read from 15 gave lsns %v", lsns)
+	}
+}
