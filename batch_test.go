@@ -771,3 +771,53 @@ func TestAgeTrackerCoalescesAndTrims(t *testing.T) {
 		t.Fatalf("oldest after compaction = %v, want %v", got, want)
 	}
 }
+
+// A sink deriving a per-record idempotency key from Batch.ID plus the record's
+// index needs every batch to hold consecutive LSNs. A dropped record must
+// therefore end the batch instead of leaving a hole in the numbering.
+func TestBatchesHoldConsecutiveRecords(t *testing.T) {
+	sink := &recorder{}
+	// One batch by size: only the undecodable record should split these.
+	b, err := Open[string](t.TempDir(), sink, poisonCodec{},
+		WithSync(SyncNever, 0),
+		WithFlush(100, 1<<20, time.Hour),
+		WithCheckpointInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	for _, rec := range []string{"a", "b", "poison", "c", "d"} {
+		if err := b.Write(ctx, rec); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := b.Close(fctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	// LSNs are 1..5 with 3 undecodable, so the deliverable records must arrive
+	// as [a b] starting at 1 and [c d] starting at 4.
+	want := []struct {
+		id      uint64
+		records []string
+	}{
+		{1, []string{"a", "b"}},
+		{4, []string{"c", "d"}},
+	}
+	if len(sink.batches) != len(want) {
+		t.Fatalf("sink got %d batches, want %d: a dropped record must end the batch", len(sink.batches), len(want))
+	}
+	for i, w := range want {
+		got := sink.batches[i]
+		if got.ID != w.id || !slices.Equal(got.Records, w.records) {
+			t.Fatalf("batch %d = {ID:%d %v}, want {ID:%d %v}", i, got.ID, got.Records, w.id, w.records)
+		}
+	}
+}

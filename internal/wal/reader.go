@@ -46,7 +46,12 @@ func (l *Log) NewReader(fromLSN uint64) (*Reader, error) {
 		}
 	}
 	if len(r.views) > 0 && fromLSN < r.views[0].baseLSN {
-		return nil, ErrTruncated
+		// Starting inside the gap recovery left is not the same as starting
+		// below records that were deleted: the gap names nothing.
+		if !r.views[0].gapBefore(fromLSN) {
+			return nil, ErrTruncated
+		}
+		fromLSN = r.views[0].baseLSN
 	}
 	r.nextLSN = fromLSN
 	return r, nil
@@ -171,6 +176,15 @@ func (r *Reader) position() error {
 	r.refresh()
 	if i, ok := r.find(r.nextLSN); ok {
 		return r.openAt(i)
+	}
+	// Recovery leaves a gap where it resumed above LSNs that may already have
+	// been handed out. Those numbers name no record, so step over them to the
+	// segment that follows the gap.
+	for i, v := range r.views {
+		if v.gapBefore(r.nextLSN) && v.count > 0 {
+			r.nextLSN = v.baseLSN
+			return r.openAt(i)
+		}
 	}
 	if len(r.views) > 0 && r.nextLSN < r.views[0].baseLSN {
 		return ErrTruncated

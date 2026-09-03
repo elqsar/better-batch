@@ -19,6 +19,13 @@ type segment struct {
 	baseLSN uint64
 	path    string
 
+	// prevEnd is the last LSN of the segment that preceded this one when it was
+	// created. Recovery checks it against the segment actually in front, which
+	// is what tells a legitimate gap in the numbering — recovery resumes above
+	// LSNs that may already have been handed out — from a segment that has gone
+	// missing and would otherwise renumber everything after it.
+	prevEnd uint64
+
 	// f is the write handle. It is non-nil only for the active (last) segment;
 	// readers open their own read-only handles.
 	f *os.File
@@ -34,24 +41,34 @@ type segment struct {
 // lastLSN returns the LSN of the final record, or baseLSN-1 when empty.
 func (s *segment) lastLSN() uint64 { return s.baseLSN + s.count - 1 }
 
-func segmentName(baseLSN uint64) string {
-	return fmt.Sprintf("%020d%s", baseLSN, segmentSuffix)
+// segmentName is baseLSN and prevEnd, both zero-padded so that sorting names
+// sorts by LSN.
+func segmentName(baseLSN, prevEnd uint64) string {
+	return fmt.Sprintf("%020d.%020d%s", baseLSN, prevEnd, segmentSuffix)
 }
 
-func parseSegmentName(name string) (uint64, bool) {
+func parseSegmentName(name string) (baseLSN, prevEnd uint64, ok bool) {
 	if !strings.HasSuffix(name, segmentSuffix) {
-		return 0, false
+		return 0, 0, false
 	}
-	n, err := strconv.ParseUint(strings.TrimSuffix(name, segmentSuffix), 10, 64)
+	base, prev, found := strings.Cut(strings.TrimSuffix(name, segmentSuffix), ".")
+	if !found {
+		return 0, 0, false
+	}
+	b, err := strconv.ParseUint(base, 10, 64)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	return n, true
+	p, err := strconv.ParseUint(prev, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return b, p, true
 }
 
-// createSegment creates and opens a new empty segment.
-func createSegment(dir string, baseLSN uint64) (*segment, error) {
-	path := filepath.Join(dir, segmentName(baseLSN))
+// createSegment creates and opens a new empty segment that follows prevEnd.
+func createSegment(dir string, baseLSN, prevEnd uint64) (*segment, error) {
+	path := filepath.Join(dir, segmentName(baseLSN, prevEnd))
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
@@ -60,7 +77,7 @@ func createSegment(dir string, baseLSN uint64) (*segment, error) {
 		f.Close()
 		return nil, err
 	}
-	return &segment{baseLSN: baseLSN, path: path, f: f}, nil
+	return &segment{baseLSN: baseLSN, prevEnd: prevEnd, path: path, f: f}, nil
 }
 
 // scanSegment reads a segment from the start, verifying every record, and

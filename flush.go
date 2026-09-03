@@ -39,15 +39,32 @@ func (b *Buffer[T]) flusher(from uint64) {
 	var (
 		records   []T
 		id        uint64
+		wantLSN   uint64 // the LSN that would extend the batch being filled
 		rangeFrom = from
-		lastRead  = from - 1
+		rangeTo   = from - 1
 		nbytes    int64
 		expired   bool
 		draining  bool
+		cut       bool // a discontinuity ends this batch early
+
+		// A record read across a discontinuity belongs to the next batch, so it
+		// is held over rather than re-read.
+		held     T
+		heldLSN  uint64
+		heldSize int64
+		hasHeld  bool
 	)
 
 	for {
-		for len(records) < b.cfg.flushRecords && nbytes < int64(b.cfg.flushBytes) {
+		if hasHeld && len(records) == 0 {
+			records = append(records, held)
+			id, wantLSN = heldLSN, heldLSN+1
+			nbytes += heldSize
+			rangeTo = heldLSN
+			hasHeld = false
+		}
+
+		for !cut && len(records) < b.cfg.flushRecords && nbytes < int64(b.cfg.flushBytes) {
 			lsn, payload, err := r.Next()
 			if errors.Is(err, wal.ErrNoData) {
 				break
@@ -56,27 +73,45 @@ func (b *Buffer[T]) flusher(from uint64) {
 				b.fail(fmt.Errorf("batch: read log: %w", err))
 				return
 			}
-			lastRead = lsn
 			size := int64(len(payload))
 
+			var v T
+			skip := false
 			if lsn < b.floor.Load() {
 				b.dropped(1, ReasonPolicy)
 				b.release(1, size)
-				continue
-			}
-			v, derr := b.codec.Decode(payload)
-			if derr != nil {
+				skip = true
+			} else if decoded, derr := b.codec.Decode(payload); derr != nil {
 				// A record that will not decode can never be delivered.
 				// Dropping it is the only alternative to wedging the pipeline.
 				b.dropped(1, ReasonDecode)
 				b.release(1, size)
+				skip = true
+			} else {
+				v = decoded
+			}
+
+			// A batch holds consecutive records, so that a sink can derive a
+			// per-record idempotency key from Batch.ID plus the record's index.
+			// A dropped record, or a gap left behind by recovery, therefore ends
+			// the batch rather than opening a hole in it.
+			if skip {
+				rangeTo = lsn // the range still covers what was dropped
+				cut = len(records) > 0
 				continue
 			}
 			if len(records) == 0 {
-				id = lsn
+				id, wantLSN = lsn, lsn
+			}
+			if lsn != wantLSN {
+				held, heldLSN, heldSize, hasHeld = v, lsn, size, true
+				cut = true
+				continue
 			}
 			records = append(records, v)
+			wantLSN++
 			nbytes += size
+			rangeTo = lsn
 		}
 
 		// Flush wants everything out now; treat the interval as elapsed rather
@@ -86,26 +121,27 @@ func (b *Buffer[T]) flusher(from uint64) {
 		}
 
 		full := len(records) >= b.cfg.flushRecords || nbytes >= int64(b.cfg.flushBytes)
-		if len(records) > 0 && (full || expired || draining) {
+		if len(records) > 0 && (full || expired || draining || cut) {
 			if !b.dispatch(pending[T]{
 				records:   records,
 				id:        id,
 				rangeFrom: rangeFrom,
-				rangeTo:   lastRead,
+				rangeTo:   rangeTo,
 				count:     int64(len(records)),
 				bytes:     nbytes,
 			}) {
 				return // aborted: the range stays unacknowledged and replays
 			}
-			records, nbytes, expired = records[:0], 0, false
-			rangeFrom = lastRead + 1
+			records, nbytes, expired, cut = records[:0], 0, false, false
+			rangeFrom = rangeTo + 1
 			continue
 		}
 
-		if len(records) == 0 && lastRead >= rangeFrom {
+		if len(records) == 0 && rangeTo >= rangeFrom {
 			// The whole range was skipped. Acknowledge it directly.
-			b.complete(rangeFrom, lastRead, 0, 0)
-			rangeFrom = lastRead + 1
+			b.complete(rangeFrom, rangeTo, 0, 0)
+			rangeFrom = rangeTo + 1
+			cut = false
 			continue
 		}
 

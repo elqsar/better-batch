@@ -14,6 +14,7 @@
 package wal
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -112,6 +113,7 @@ type Log struct {
 
 	nextLSN  uint64 // LSN the next appended record will get
 	firstLSN uint64 // lowest LSN still on disk
+	reserved uint64 // highest LSN durably claimed, never handed out twice
 
 	pending    []byte // records staged for the next commit round
 	spare      []byte // buffer handed back by the committer, reused for staging
@@ -175,24 +177,31 @@ func (l *Log) recover() error {
 	if err != nil {
 		return err
 	}
-	var bases []uint64
+	type found struct{ base, prevEnd uint64 }
+	var names []found
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if base, ok := parseSegmentName(e.Name()); ok {
-			bases = append(bases, base)
+		if base, prevEnd, ok := parseSegmentName(e.Name()); ok {
+			names = append(names, found{base, prevEnd})
 		}
 	}
-	slices.Sort(bases)
+	slices.SortFunc(names, func(a, b found) int { return cmp.Compare(a.base, b.base) })
 
-	for i, base := range bases {
-		path := filepath.Join(l.dir, segmentName(base))
+	reserved, err := readReserved(l.dir)
+	if err != nil {
+		return err
+	}
+	l.reserved = reserved
+
+	for i, n := range names {
+		path := filepath.Join(l.dir, segmentName(n.base, n.prevEnd))
 		count, good, torn, err := scanSegment(path, l.opts.MaxRecordBytes)
 		if err != nil {
 			return err
 		}
-		last := i == len(bases)-1
+		last := i == len(names)-1
 		if torn && !last {
 			return fmt.Errorf("wal: segment %s is truncated but is not the last segment", path)
 		}
@@ -201,36 +210,54 @@ func (l *Log) recover() error {
 				return err
 			}
 		}
-		s := &segment{baseLSN: base, path: path, size: good, count: count}
+		s := &segment{baseLSN: n.base, prevEnd: n.prevEnd, path: path, size: good, count: count}
 		if i > 0 {
 			prev := l.segs[i-1]
-			if prev.baseLSN+prev.count != base {
-				return fmt.Errorf("wal: segment chain broken: %s ends at LSN %d but %s starts at %d",
-					prev.path, prev.lastLSN(), path, base)
+			if prev.lastLSN() != s.prevEnd {
+				return fmt.Errorf("wal: segment chain broken: %s ends at LSN %d but %s expects to follow %d",
+					prev.path, prev.lastLSN(), path, s.prevEnd)
 			}
 		}
 		l.segs = append(l.segs, s)
 	}
 
-	if len(l.segs) == 0 {
-		s, err := createSegment(l.dir, 1)
+	switch {
+	case len(l.segs) == 0:
+		// A reservation with no segments left means every segment file is gone;
+		// numbering still resumes above anything already handed out.
+		s, err := createSegment(l.dir, l.reserved+1, l.reserved)
 		if err != nil {
 			return err
 		}
 		l.segs = append(l.segs, s)
-	} else {
-		last := l.segs[len(l.segs)-1]
-		f, err := os.OpenFile(last.path, os.O_RDWR|os.O_APPEND, 0o644)
-		if err != nil {
-			return err
+		l.durable = l.reserved
+
+	default:
+		tail := l.segs[len(l.segs)-1].lastLSN()
+		if l.reserved > tail {
+			// LSNs above the surviving tail were handed out before the crash and
+			// may already be downstream, named in a batch the sink deduplicates
+			// against. Reusing them would make one LSN mean two different
+			// records, so the log resumes above the reservation and leaves a gap.
+			s, err := createSegment(l.dir, l.reserved+1, tail)
+			if err != nil {
+				return err
+			}
+			l.segs = append(l.segs, s)
+		} else {
+			last := l.segs[len(l.segs)-1]
+			f, err := os.OpenFile(last.path, os.O_RDWR|os.O_APPEND, 0o644)
+			if err != nil {
+				return err
+			}
+			last.f = f
 		}
-		last.f = f
+		l.durable = tail
 	}
 
 	l.active = l.segs[len(l.segs)-1]
 	l.firstLSN = l.segs[0].baseLSN
 	l.nextLSN = l.active.baseLSN + l.active.count
-	l.durable = l.nextLSN - 1
 	return nil
 }
 
@@ -325,6 +352,17 @@ func (l *Log) stage(encode func([]byte) []byte, n uint64) (first, epoch uint64, 
 	}
 	if l.broken {
 		return 0, 0, false, l.failErr
+	}
+	// LSNs are claimed durably before they are handed out, in blocks so the
+	// fsync costs one round per reserveBlock records. Without this a crash that
+	// loses the log tail would renumber new records over LSNs the sink has
+	// already seen.
+	if last := l.nextLSN + n - 1; last > l.reserved {
+		want := max(last, l.nextLSN+reserveBlock-1)
+		if err := writeReserved(l.dir, want); err != nil {
+			return 0, 0, false, fmt.Errorf("wal: reserve LSNs: %w", err)
+		}
+		l.reserved = want
 	}
 	epoch = l.epoch
 	first = l.nextLSN
@@ -511,7 +549,7 @@ func (l *Log) writeBatch(buf []byte, first, n uint64) error {
 	l.mu.Unlock()
 
 	if rotate {
-		next, err := createSegment(l.dir, first)
+		next, err := createSegment(l.dir, first, first-1)
 		if err != nil {
 			return err
 		}
@@ -626,7 +664,18 @@ func (l *Log) Close() error {
 	l.mu.Lock()
 	err := l.closeErr
 	active := l.active
+	durable, reserved := l.durable, l.reserved
 	l.mu.Unlock()
+
+	// A clean shutdown knows exactly which LSNs were used, so it gives the
+	// unused remainder of the block back. Without this every restart would skip
+	// a block, and the numbering of a log that was closed properly should just
+	// continue.
+	if reserved > durable {
+		if rerr := writeReserved(l.dir, durable); err == nil {
+			err = rerr
+		}
+	}
 
 	if active != nil && active.f != nil {
 		if serr := active.f.Sync(); err == nil {
@@ -648,16 +697,21 @@ func (l *Log) Close() error {
 type segView struct {
 	path    string
 	baseLSN uint64
+	prevEnd uint64
 	count   uint64
 	size    int64
 }
+
+// gapBefore reports whether lsn falls in the unused stretch in front of this
+// segment: a number recovery skipped rather than one whose record was deleted.
+func (v segView) gapBefore(lsn uint64) bool { return lsn > v.prevEnd && lsn < v.baseLSN }
 
 func (l *Log) snapshot() ([]segView, uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	views := make([]segView, len(l.segs))
 	for i, s := range l.segs {
-		views[i] = segView{path: s.path, baseLSN: s.baseLSN, count: s.count, size: s.size}
+		views[i] = segView{path: s.path, baseLSN: s.baseLSN, prevEnd: s.prevEnd, count: s.count, size: s.size}
 	}
 	return views, l.durable
 }

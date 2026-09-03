@@ -83,16 +83,29 @@ The checkpoint advances only after `Sink.Flush` returns nil. A crash between tho
 points replays the batch.
 
 There is no exactly-once mode, because it isn't achievable without the sink's cooperation.
-What you get instead is `Batch.ID` — the log sequence number of the batch's first record,
-**stable across retries and across restarts**. Give a sink with idempotency keys or a
-transactional destination that ID and you get effectively-once:
+What you get instead is a stable identity per **record**: `Batch.ID` is the log sequence
+number of the batch's first record, and a batch always holds consecutive records, so
+record `i` is `b.ID + i`. That number names one record for the life of the buffer — across
+retries, across restarts, and across a crash that loses the log's tail. Give a sink with
+idempotency keys or a transactional destination those numbers and you get
+effectively-once:
 
 ```go
 sink := batch.SinkFunc[Event](func(ctx context.Context, b batch.Batch[Event]) error {
-    // Same ID on every retry and after a crash, so the destination can dedupe.
-    return db.InsertIdempotent(ctx, fmt.Sprintf("batch-%d", b.ID), b.Records)
+    rows := make([]Row, len(b.Records))
+    for i, e := range b.Records {
+        // Same key on every retry and after a crash, so the destination can dedupe.
+        rows[i] = Row{Key: b.ID + uint64(i), Event: e}
+    }
+    return db.InsertIdempotent(ctx, rows)
 })
 ```
+
+**Deduplicate by record, not by batch.** Batch boundaries are not stable: after a restart
+the same records can be regrouped, so a batch that was delivered as `{ID: 1, 5 records}`
+may come back as `{ID: 1, 10 records}`. A sink that skips the whole batch because it has
+seen ID 1 would silently discard the five records it had not. Record keys do not have this
+problem, which is why they are the unit to deduplicate on.
 
 ## Durability
 
@@ -523,7 +536,14 @@ wedging the pipeline behind it.
 
 ## Operational notes
 
-- **One writer per directory**, enforced with a lock file. A second `Open` fails.
+- **One writer per directory**, enforced with a lock file. A second `Open` fails. The lock
+  is `flock`, so enforcement is Unix-only; elsewhere the single-writer rule is yours to keep.
+- **Sequence numbers are never reused.** They are claimed durably, a block at a time, before
+  any record is handed one, so a crash that loses the log's tail resumes above the numbers
+  that went with it rather than renumbering over them. The visible effect is a one-off gap
+  in `Batch.ID` after an unclean restart — the price of a key the sink can trust. A clean
+  `Close` gives the unused remainder of the block back, so an orderly restart continues
+  where it left off.
 - **Recovery** scans and checksum-verifies every segment on open. A bad record that
   reaches the end of the log is a torn tail — expected after a crash — and is truncated.
   A bad record with intact records after it is interior corruption and fails `Open`,

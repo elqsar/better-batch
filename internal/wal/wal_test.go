@@ -259,13 +259,17 @@ func TestRecoverFromTornTail(t *testing.T) {
 					trial, cut, i, lsns[i], payloads[i], i+1, payload(i))
 			}
 		}
-		// Appends must resume immediately after the surviving prefix.
+		// Appends must resume above the surviving prefix. They do not resume
+		// immediately after it: LSNs the torn-off tail used may already be
+		// downstream, and handing the same number to a different record would
+		// break deduplication in the sink.
 		next, err := l2.Append(context.Background(), payload(9999))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := uint64(len(payloads) + 1); next != want {
-			t.Fatalf("trial %d: LSN after recovery = %d, want %d", trial, next, want)
+		if last := lsns[len(lsns)-1]; next <= last {
+			t.Fatalf("trial %d (cut %d): LSN after recovery = %d, reusing a number at or below the surviving tail %d",
+				trial, cut, next, last)
 		}
 		l2.Close()
 	}
@@ -407,6 +411,9 @@ func TestReaderFollowsWriter(t *testing.T) {
 }
 
 func TestDirectoryLockIsExclusive(t *testing.T) {
+	if !lockEnforced {
+		t.Skip("the directory lock is flock; other platforms leave single-writer to the caller")
+	}
 	dir := t.TempDir()
 	l := open(t, dir, Options{})
 
@@ -714,5 +721,96 @@ func TestTruncateRetriesAfterRemoveFailure(t *testing.T) {
 	lsns, _ := readAll(t, l, 15)
 	if len(lsns) == 0 || lsns[0] != 15 {
 		t.Fatalf("read from 15 gave lsns %v", lsns)
+	}
+}
+
+// A machine crash can take back writes the operating system had not flushed,
+// leaving a log shorter than the LSNs it had already handed out. Those numbers
+// may name records the sink has seen and the checkpoint says were delivered, so
+// recovery must never attach them to a different record.
+func TestLostTailDoesNotReuseLSNs(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 50 {
+		if _, err := l.Append(context.Background(), payload(i)); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	handedOut := l.DurableLSN()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The machine crash: records the operating system had not flushed go away,
+	// while the reservation, which is fsynced, does not.
+	segs, _ := filepath.Glob(filepath.Join(dir, "*"+segmentSuffix))
+	sort.Strings(segs)
+	lastSeg := segs[len(segs)-1]
+	st, err := os.Stat(lastSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(lastSeg, st.Size()/3); err != nil {
+		t.Fatal(err)
+	}
+
+	l2 := open(t, dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	survived, _ := readAll(t, l2, 0)
+	if len(survived) == 0 || uint64(len(survived)) >= handedOut {
+		t.Fatalf("test did not lose a tail: %d of %d records survived", len(survived), handedOut)
+	}
+	lsn, err := l2.Append(context.Background(), payload(999))
+	if err != nil {
+		t.Fatalf("Append after recovery: %v", err)
+	}
+	if lsn <= handedOut {
+		t.Fatalf("LSN after recovery = %d, reusing a number already handed out (up to %d)", lsn, handedOut)
+	}
+
+	// The gap must not hide the records that follow it from a reader, including
+	// one starting inside the gap itself.
+	for _, from := range []uint64{0, survived[len(survived)-1] + 1} {
+		lsns, _ := readAll(t, l2, from)
+		if len(lsns) == 0 || lsns[len(lsns)-1] != lsn {
+			t.Fatalf("reader from %d ended at %v, want it to reach the record at %d", from, lsns, lsn)
+		}
+	}
+}
+
+// The gap recovery leaves must not be confused with a segment that has gone
+// missing, which really would renumber every record after it.
+func TestMissingSegmentIsStillRejectedAcrossAGap(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{SyncMode: SyncNever, MaxSegmentBytes: 256, CommitBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		if _, err := l.Append(context.Background(), payload(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segs, _ := filepath.Glob(filepath.Join(dir, "*"+segmentSuffix))
+	sort.Strings(segs)
+	if len(segs) < 3 {
+		t.Fatalf("want several segments, got %d", len(segs))
+	}
+	// Chop the tail so reopening leaves a legitimate gap, and delete a middle
+	// segment so the run also contains an illegitimate one.
+	st, _ := os.Stat(segs[len(segs)-1])
+	if err := os.Truncate(segs[len(segs)-1], st.Size()/2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(segs[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{SyncMode: SyncNever}); err == nil {
+		t.Fatal("Open accepted a log with a segment missing from the middle")
 	}
 }

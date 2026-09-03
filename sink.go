@@ -8,9 +8,17 @@ import (
 
 // Batch is a group of records handed to a sink.
 type Batch[T any] struct {
-	// ID is the log sequence number of the first record. It is stable across
-	// retries and across restarts, so a sink with an idempotent destination can
-	// use it as a deduplication key and get effectively-once delivery.
+	// ID is the log sequence number of the first record. Records in a batch are
+	// consecutive, so Records[i] has the number ID+i, and that number names one
+	// record for the life of the buffer: across retries, across restarts, and
+	// across a crash that takes the log's tail with it. A sink with an
+	// idempotent destination can use it as a deduplication key and get
+	// effectively-once delivery.
+	//
+	// Deduplicate per record rather than per batch. Which records travel
+	// together is not stable — a restart can regroup them — so skipping a whole
+	// batch whose ID has been seen before can discard records that came with it
+	// the second time.
 	ID uint64
 
 	// Records are the decoded events, in the order they were written.

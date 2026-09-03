@@ -6,6 +6,11 @@ in, get batches out, survive a crash, and control what happens when the sink can
 Not a daemon. Not a broker. If you need multi-process or multi-host, use NATS or Kafka —
 this is the thing you embed in the process that is already producing the events.
 
+> This is the design record: what was decided, why, and what the measurements said. It is
+> kept as written rather than edited to match the result, so the sketches below show the
+> intended shape, not the shipped API — some of it changed under contact with the problem.
+> The README documents what actually exists.
+
 ## Goals
 
 - **Durable ingest.** An event accepted by `Write` survives `kill -9`, within a documented
@@ -104,6 +109,9 @@ Three goroutines: the caller's (append), the committer (group commit + fsync), t
 (read → batch → sink → checkpoint).
 
 ## API sketch
+
+*Written before implementation; `WithMode` and `SyncInterval(d)` did not survive it. See
+the README for the API as shipped.*
 
 ```go
 type Sink[T any] interface {
@@ -322,7 +330,7 @@ weaken the one guarantee the library exists to make. `SyncNever` is the fast mod
 2. ~~`Buffer[T]` — batcher, flusher, sink retry, checkpoint advance.~~ **done**
 3. ~~Backpressure policies + capacity accounting, including disk-full.~~ **done**
 4. ~~`Ephemeral` mode.~~ **dropped** — see *Measured*; `SyncNever` covers it.
-5. Observability. `Stats` already carries depth, lag, retries, drops and disk-full
-   events. Flush-latency histograms need a hook, and wiring OTel directly would put a
-   dependency in a library that currently has none — decide before building. ← next
-6. Sinks worth shipping: ClickHouse, Kafka, OTLP, plus `func` adapters.
+5. ~~Observability.~~ **done** — `Stats` plus `Observer` callbacks. The dependency question
+   settled itself: the callbacks carry everything, so Prometheus and OTel wiring lives in
+   the README instead of in the module.
+6. Sinks worth shipping: ClickHouse, Kafka, OTLP, plus `func` adapters. ← next

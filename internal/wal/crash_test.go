@@ -63,12 +63,15 @@ func TestSurvivesSIGKILL(t *testing.T) {
 				i, lsns[i], payloads[i], i+1, payload(i))
 		}
 	}
+	// Recovery resumes above every LSN that may have been handed out before the
+	// crash, not merely above the ones that survived, so a number the sink has
+	// already seen is never attached to a different record.
 	next, err := l.Append(context.Background(), payload(len(payloads)))
 	if err != nil {
 		t.Fatalf("append after recovery: %v", err)
 	}
-	if want := uint64(len(payloads) + 1); next != want {
-		t.Fatalf("LSN after recovery = %d, want %d", next, want)
+	if last := lsns[len(lsns)-1]; next <= last {
+		t.Fatalf("LSN after recovery = %d, which reuses a number at or below the recovered tail %d", next, last)
 	}
 	t.Logf("recovered %d records written before SIGKILL", len(payloads))
 }

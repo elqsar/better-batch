@@ -6,9 +6,9 @@
 // before Write returns, then assembles records into batches by count, byte
 // size, or time, and delivers them to a [Sink]. Records are released — and
 // their log space reclaimed — only after the sink acknowledges them, giving
-// at-least-once delivery across process crashes. [Batch.ID] is stable across
-// retries and restarts, so a sink that uses it as an idempotency key gets
-// effectively-once delivery.
+// at-least-once delivery across process crashes. Records in a batch are
+// consecutive and numbered from [Batch.ID], and a number is never reused, so a
+// sink that treats ID+i as an idempotency key gets effectively-once delivery.
 //
 // Backpressure is pluggable through the [Policy] interface: block, reject,
 // drop newest, drop oldest, or block with a deadline and then shed. A full

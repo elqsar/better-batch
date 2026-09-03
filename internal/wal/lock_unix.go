@@ -9,6 +9,9 @@ import (
 	"syscall"
 )
 
+// lockEnforced reports whether lockDir actually excludes a second writer.
+const lockEnforced = true
+
 // lockDir takes an exclusive advisory lock on the log directory. The lock is
 // held for as long as the returned file is open and is released by closing it,
 // including when the process dies.
