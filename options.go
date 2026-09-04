@@ -10,12 +10,15 @@ import (
 type SyncMode int
 
 const (
-	// SyncPeriodic fsyncs on a timer or once enough bytes have accumulated. A
-	// crash loses at most SyncInterval worth of writes. The default.
+	// SyncPeriodic fsyncs on a timer or once enough bytes have accumulated, and
+	// Write returns once that fsync is done. The interval is therefore latency a
+	// write may wait, not data it may lose: it is how long the buffer holds out
+	// for company, so that concurrent writes share one fsync. The default.
 	SyncPeriodic SyncMode = iota
 
-	// SyncAlways fsyncs before every Write returns. Concurrent writers still
-	// share one fsync, so throughput comes from concurrency and WriteBatch.
+	// SyncAlways commits as soon as there is something to commit, trading
+	// throughput for latency. Concurrent writers still share one fsync, so
+	// throughput comes from concurrency and WriteBatch.
 	SyncAlways
 
 	// SyncNever hands records to the operating system but never fsyncs. A
@@ -53,7 +56,7 @@ func defaults() config {
 		flushInterval:      time.Second,
 		maxInFlight:        1,
 		policy:             Block(),
-		backoff:            Backoff{}.withDefaults(),
+		backoff:            Backoff{Jitter: 0.2}.withDefaults(),
 		maxAttempts:        0, // retry forever; a durable buffer should not drop by default
 		checkpointInterval: 200 * time.Millisecond,
 	}
@@ -63,7 +66,7 @@ func defaults() config {
 type Option func(*config)
 
 // WithSync selects the durability policy. interval applies to SyncPeriodic and
-// bounds how long a write can sit uncommitted; it defaults to 5ms.
+// bounds how long a write waits to be committed with others; it defaults to 5ms.
 func WithSync(mode SyncMode, interval time.Duration) Option {
 	return func(c *config) {
 		c.wal.SyncMode = walSyncMode(mode)
@@ -147,6 +150,10 @@ func WithOnFull(p Policy) Option {
 // is the default: a durable buffer that drops data on a transient outage is not
 // doing its job. With a positive maxAttempts, an exhausted batch goes to the
 // dead-letter sink, or is dropped and counted if there is none.
+//
+// A zero field in b takes its default, except Jitter, where zero means no
+// randomisation. The buffer's own default is 0.2, which is what stops a fleet
+// that shared an outage from retrying in lockstep.
 func WithRetry(b Backoff, maxAttempts int) Option {
 	return func(c *config) {
 		c.backoff = b.withDefaults()

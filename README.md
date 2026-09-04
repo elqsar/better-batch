@@ -109,11 +109,18 @@ problem, which is why they are the unit to deduplicate on.
 
 ## Durability
 
+The columns are about writes that have **returned**. A write still in flight can always be
+lost by a crash, in every mode.
+
 | Mode | `Write` returns when | Process crash | Machine crash |
 | --- | --- | --- | --- |
-| `SyncPeriodic` (default, 5ms) | the record is fsynced, on a timer | nothing lost | ≤ one interval lost |
-| `SyncAlways` | the record is fsynced | nothing lost | nothing lost |
+| `SyncPeriodic` (default, 5ms) | the record is fsynced, after waiting up to the interval for company | nothing lost | nothing lost |
+| `SyncAlways` | the record is fsynced, with no wait | nothing lost | nothing lost |
 | `SyncNever` | the record is in the page cache | nothing lost | recent writes lost |
+
+`SyncPeriodic` and `SyncAlways` differ in latency and fsync count, not in what survives:
+the interval is how long a write waits so that concurrent writes can share one fsync. It is
+not a loss window — `Write` does not return until its own record is durable.
 
 ```go
 batch.WithSync(batch.SyncAlways, 0)

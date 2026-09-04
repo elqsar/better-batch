@@ -79,10 +79,16 @@ type Options struct {
 	// pending, bounding both commit latency and segment overshoot. Default 1 MiB.
 	CommitBytes int
 
-	// WriteFunc replaces the segment write. It exists so tests can inject
-	// partial writes and I/O errors; production code leaves it nil. The package
-	// is internal, so this never reaches the library's public API.
+	// WriteFunc replaces the writes the log makes to disk: segment appends and
+	// the LSN reservation. It exists so tests can inject partial writes and I/O
+	// errors; production code leaves it nil. The package is internal, so this
+	// never reaches the library's public API.
 	WriteFunc func(*os.File, []byte) (int, error)
+
+	// SyncFunc replaces the fsync of a segment, for the same reason: a failure
+	// there has to be reachable from a test, because it is the point where a
+	// half-finished rotation would otherwise be left behind. Nil in production.
+	SyncFunc func(*os.File) error
 }
 
 func (o Options) withDefaults() Options {
@@ -223,14 +229,19 @@ func (l *Log) recover() error {
 
 	switch {
 	case len(l.segs) == 0:
-		// A reservation with no segments left means every segment file is gone;
-		// numbering still resumes above anything already handed out.
-		s, err := createSegment(l.dir, l.reserved+1, l.reserved)
+		// Every segment file is gone, but a surviving reservation still says
+		// which numbers are spent, so the log resumes above them. prevEnd stays
+		// 0: nothing precedes this segment on disk, and declaring the whole span
+		// below it a gap is what lets a reader that starts down there — at a
+		// checkpoint written before the files vanished — step up to it instead
+		// of reporting records truncated away. Nothing is durable, so the log is
+		// empty rather than durable up to the reservation.
+		s, err := createSegment(l.dir, l.reserved+1, 0)
 		if err != nil {
 			return err
 		}
 		l.segs = append(l.segs, s)
-		l.durable = l.reserved
+		l.durable = 0
 
 	default:
 		tail := l.segs[len(l.segs)-1].lastLSN()
@@ -359,7 +370,7 @@ func (l *Log) stage(encode func([]byte) []byte, n uint64) (first, epoch uint64, 
 	// already seen.
 	if last := l.nextLSN + n - 1; last > l.reserved {
 		want := max(last, l.nextLSN+reserveBlock-1)
-		if err := writeReserved(l.dir, want); err != nil {
+		if err := l.writeReserved(want); err != nil {
 			return 0, 0, false, fmt.Errorf("wal: reserve LSNs: %w", err)
 		}
 		l.reserved = want
@@ -542,6 +553,14 @@ func (l *Log) rollback() error {
 	return active.f.Sync()
 }
 
+// sync fsyncs a segment file, through the test hook when one is installed.
+func (l *Log) sync(f *os.File) error {
+	if l.opts.SyncFunc != nil {
+		return l.opts.SyncFunc(f)
+	}
+	return f.Sync()
+}
+
 func (l *Log) writeBatch(buf []byte, first, n uint64) error {
 	l.mu.Lock()
 	active := l.active
@@ -553,12 +572,16 @@ func (l *Log) writeBatch(buf []byte, first, n uint64) error {
 		if err != nil {
 			return err
 		}
-		if err := active.f.Sync(); err != nil {
-			next.f.Close()
+		// The new segment exists before the old one is closed, so any failure
+		// in between has to take it away again: the retry after the rollback
+		// asks for the same name, and O_EXCL would turn one bad fsync into a
+		// log that can never rotate.
+		if err := l.sync(active.f); err != nil {
+			next.discard()
 			return err
 		}
 		if err := active.f.Close(); err != nil {
-			next.f.Close()
+			next.discard()
 			return err
 		}
 		l.mu.Lock()
@@ -577,7 +600,7 @@ func (l *Log) writeBatch(buf []byte, first, n uint64) error {
 		return err
 	}
 	if l.opts.SyncMode != SyncNever {
-		if err := active.f.Sync(); err != nil {
+		if err := l.sync(active.f); err != nil {
 			return err
 		}
 	}
@@ -672,7 +695,7 @@ func (l *Log) Close() error {
 	// a block, and the numbering of a log that was closed properly should just
 	// continue.
 	if reserved > durable {
-		if rerr := writeReserved(l.dir, durable); err == nil {
+		if rerr := l.writeReserved(durable); err == nil {
 			err = rerr
 		}
 	}

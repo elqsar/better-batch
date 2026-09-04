@@ -262,28 +262,27 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 			return err
 		}
 		c, err := b.log.AppendBatchAsync(payloads)
-		if err != nil {
-			// Staging is memory-only, so this is a closed or broken log, or an
-			// oversized record — never ENOSPC, which surfaces from Await once
-			// the round has been rolled back.
-			b.release(n, size)
-			return fmt.Errorf("batch: append: %w", err)
-		}
-		switch err = b.log.Await(ctx, c); {
-		case err == nil:
-			b.accept(c.Last, n, size)
-			return nil
-		case errors.Is(err, wal.ErrPending):
-			// ctx expired with the commit round still in flight. The records are
-			// staged and will very likely land, so the reservation stays put and
-			// a settler finishes the accounting once the round completes.
-			b.settle(c, n, size)
-			return fmt.Errorf("%w: %w", ErrUncertain, err)
-		default:
-			b.release(n, size)
-			if !isDiskFull(err) {
-				return fmt.Errorf("batch: append: %w", err)
+		if err == nil {
+			switch err = b.log.Await(ctx, c); {
+			case err == nil:
+				b.accept(c.Last, n, size)
+				return nil
+			case errors.Is(err, wal.ErrPending):
+				// ctx expired with the commit round still in flight. The records
+				// are staged and will very likely land, so the reservation stays
+				// put and a settler finishes the accounting once the round
+				// completes.
+				b.settle(c, n, size)
+				return fmt.Errorf("%w: %w", ErrUncertain, err)
 			}
+		}
+		// Both halves can fail on a full disk. Committing obviously can; staging
+		// can too, because claiming a block of LSNs writes them down first, and
+		// the very first write to a directory does that. Either way the log has
+		// rolled back to a state where retrying is safe.
+		b.release(n, size)
+		if !isDiskFull(err) {
+			return fmt.Errorf("batch: append: %w", err)
 		}
 		// The filesystem is the limit, not the configured capacity. A failed
 		// commit is rolled back by the log, so retrying is safe once the
@@ -366,8 +365,11 @@ func (b *Buffer[T]) reserve(n, size int64) bool {
 // was reserved before the append and stays held until the flusher delivers the
 // records.
 func (b *Buffer[T]) accept(last uint64, n, size int64) {
-	b.wrote(int(n), int(size))
+	// Note the age before the observer callback: the records are durable, so
+	// the flusher may already be delivering them, and OnWrite is the caller's
+	// code and free to take as long as it likes.
 	b.ages.note(last, time.Now().UnixNano())
+	b.wrote(int(n), int(size))
 	b.nudge()
 }
 
@@ -447,6 +449,10 @@ func (b *Buffer[T]) dropOldest(n, size int64) {
 	avg := max(b.pendingBytes.Load()/records, 1)
 	// Free room for this write plus headroom, so a stream of writes against a
 	// dead sink does not re-enter the policy for every single record.
+	//
+	// The floor is an LSN but want is a record count, and the two only agree
+	// where the numbering is dense. Across the gap left by a recovery this sheds
+	// more than asked for, which is within what a drop policy promises.
 	want := min(max(n+n/4+1, size/avg), records)
 	b.raiseFloor(b.acks.mark() + 1 + uint64(want))
 	b.nudge()

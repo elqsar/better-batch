@@ -84,6 +84,13 @@ func (a *ackTracker) mark() uint64 {
 type ageTracker struct {
 	mu    sync.Mutex
 	marks []ageMark
+
+	// trimmed is the highest acknowledged LSN. A record is durable, and so
+	// deliverable, before its writer gets round to noting it, so a mark can
+	// arrive after the delivery that should have removed it. Remembering what
+	// has been trimmed is what stops such a mark from lingering as a backlog
+	// that is not there.
+	trimmed uint64
 }
 
 type ageMark struct {
@@ -100,6 +107,9 @@ const (
 func (a *ageTracker) note(lsn uint64, now int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if lsn <= a.trimmed {
+		return // already delivered while this writer was on its way here
+	}
 	if n := len(a.marks); n > 0 {
 		if lsn <= a.marks[n-1].lsn {
 			return
@@ -132,6 +142,7 @@ func (a *ageTracker) note(lsn uint64, now int64) {
 func (a *ageTracker) trim(mark uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.trimmed = max(a.trimmed, mark)
 	i := 0
 	for i < len(a.marks) && a.marks[i].lsn <= mark {
 		i++
@@ -157,7 +168,7 @@ type Backoff struct {
 	Initial time.Duration // delay before the second attempt; default 100ms
 	Max     time.Duration // ceiling; default 30s
 	Factor  float64       // multiplier per attempt; default 2
-	Jitter  float64       // fraction of the delay to randomise; default 0.2
+	Jitter  float64       // fraction of the delay to randomise; 0 turns it off
 }
 
 func (b Backoff) withDefaults() Backoff {
@@ -170,9 +181,9 @@ func (b Backoff) withDefaults() Backoff {
 	if b.Factor <= 1 {
 		b.Factor = 2
 	}
-	if b.Jitter < 0 || b.Jitter > 1 {
-		b.Jitter = 0.2
-	}
+	// Zero is a real choice here, not an unset field: it makes retries land at
+	// predictable times. Only out-of-range values are corrected.
+	b.Jitter = min(max(b.Jitter, 0), 1)
 	return b
 }
 

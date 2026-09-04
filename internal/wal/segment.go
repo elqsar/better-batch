@@ -80,6 +80,17 @@ func createSegment(dir string, baseLSN, prevEnd uint64) (*segment, error) {
 	return &segment{baseLSN: baseLSN, prevEnd: prevEnd, path: path, f: f}, nil
 }
 
+// discard closes a segment and removes its file. It is for a segment that was
+// created but never became part of the log, so both failures are moot: the
+// caller is already returning the error that made the segment unwanted.
+func (s *segment) discard() {
+	if s.f != nil {
+		s.f.Close()
+		s.f = nil
+	}
+	os.Remove(s.path)
+}
+
 // scanSegment reads a segment from the start, verifying every record, and
 // reports how many complete records it holds and where the last one ends.
 //

@@ -66,6 +66,10 @@ its own side and get effectively-once. Honest, and actually usable.
 **Durability — configurable.** `SyncAlways` / `SyncInterval(d)` / `SyncNever`. Default is
 `SyncInterval(5ms)`: a bounded, documented loss window instead of a vague one.
 
+> As built, this one came out stronger than planned. `Write` waits for its own record to be
+> durable, so the interval turned into latency a write may wait, not data it may lose —
+> `SyncPeriodic` loses no acknowledged write. See the README's durability table.
+
 **Retry — configurable.** Backoff with max attempts, then the batch goes to a dead-letter
 sink so one poison batch cannot wedge the pipeline.
 

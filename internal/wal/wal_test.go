@@ -814,3 +814,97 @@ func TestMissingSegmentIsStillRejectedAcrossAGap(t *testing.T) {
 		t.Fatal("Open accepted a log with a segment missing from the middle")
 	}
 }
+
+// Losing every segment file while the reservation survives — a deletion or a
+// damaged filesystem, not the ordinary crash — must still leave a log that
+// works. Recovery numbers above the reservation, and the span below it is a gap
+// that names nothing rather than records that were truncated away.
+func TestTotalSegmentLossStillYieldsAWorkingLog(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 {
+		if _, err := l.Append(context.Background(), payload(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handedOut := l.DurableLSN()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	segs, _ := filepath.Glob(filepath.Join(dir, "*"+segmentSuffix))
+	for _, s := range segs {
+		if err := os.Remove(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	l2 := open(t, dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	// A reader positioned where the checkpoint left it is below the new base and
+	// must step up to it, not report ErrTruncated.
+	r, err := l2.NewReader(1)
+	if err != nil {
+		t.Fatalf("NewReader(1) after total segment loss: %v", err)
+	}
+	r.Close()
+
+	lsn, err := l2.Append(context.Background(), payload(99))
+	if err != nil {
+		t.Fatalf("Append after total segment loss: %v", err)
+	}
+	if lsn <= handedOut {
+		t.Fatalf("LSN after total segment loss = %d, reusing a number already handed out (up to %d)", lsn, handedOut)
+	}
+	lsns, payloads := readAll(t, l2, 0)
+	if len(payloads) != 1 || lsns[0] != lsn {
+		t.Fatalf("read back %v, want just the record at %d", lsns, lsn)
+	}
+}
+
+// A rotation that fails after creating the next segment must not leave the file
+// behind: the retry asks for the same name, and O_EXCL would make one bad write
+// permanent.
+func TestFailedRotationCanBeRetried(t *testing.T) {
+	dir := t.TempDir()
+	var failing atomic.Bool
+	opts := Options{SyncMode: SyncAlways, MaxSegmentBytes: 128, CommitBytes: 1}
+	// Rotation creates the next segment and then fsyncs the one it is leaving.
+	// Failing that fsync is what strands the new file.
+	opts.SyncFunc = func(f *os.File) error {
+		if failing.Load() {
+			return syscall.ENOSPC
+		}
+		return f.Sync()
+	}
+	l := open(t, dir, opts)
+
+	ctx := context.Background()
+	for i := range 10 {
+		if _, err := l.Append(ctx, payload(i)); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+	before, _ := filepath.Glob(filepath.Join(dir, "*"+segmentSuffix))
+	if len(before) < 2 {
+		t.Fatalf("want rotation to have happened, got %d segments", len(before))
+	}
+
+	failing.Store(true)
+	for i := 10; i < 20; i++ {
+		if _, err := l.Append(ctx, payload(i)); err == nil {
+			t.Fatalf("Append %d succeeded while every fsync was failing", i)
+		}
+	}
+	failing.Store(false)
+
+	// The log must still be able to rotate and accept records: the segment the
+	// failed rotation created has to be gone, or O_EXCL rejects it forever.
+	for i := 20; i < 40; i++ {
+		if _, err := l.Append(ctx, payload(i)); err != nil {
+			t.Fatalf("Append %d after the disk came back: %v; a failed rotation left its segment behind", i, err)
+		}
+	}
+}

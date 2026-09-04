@@ -185,7 +185,11 @@ func (b *Buffer[T]) dispatch(p pending[T]) bool {
 
 func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 	for attempt := 1; ; attempt++ {
-		if p.rangeFrom < b.floor.Load() {
+		// The floor is compared against the first record, not against rangeFrom:
+		// the range also covers LSNs that carry no record — skipped ones, and
+		// the gap recovery leaves — and a floor raised into those would abandon
+		// a batch whose records are all above it.
+		if p.id < b.floor.Load() {
 			// DropOldest cut into this batch while it was in flight. It can
 			// only be abandoned whole, which also frees the delivery slot the
 			// flusher may be waiting on.

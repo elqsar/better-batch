@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -17,10 +18,28 @@ func withWriteFault(fn func(*os.File, []byte) (int, error)) Option {
 	return func(c *config) { c.wal.WriteFunc = fn }
 }
 
-// enospcAfter returns a write function that starts failing once the flag is set.
+// isSegment tells the log's two kinds of write apart: the hook covers both
+// segment appends and the LSN reservation, and a test usually wants one of them.
+func isSegment(f *os.File) bool { return strings.HasSuffix(f.Name(), ".log") }
+
+// enospcAfter returns a write function whose segment writes start failing once
+// the flag is set, leaving the reservation alone.
 func enospcAfter(failing *atomic.Bool) func(*os.File, []byte) (int, error) {
 	return func(f *os.File, b []byte) (int, error) {
-		if failing.Load() {
+		if failing.Load() && isSegment(f) {
+			return 0, syscall.ENOSPC
+		}
+		return f.Write(b)
+	}
+}
+
+// enospcReserving is the mirror image: only the reservation write fails. That is
+// the other write on the accept path, and the one a full disk hits first,
+// because a fresh directory claims its first block of LSNs before it can stage
+// anything.
+func enospcReserving(failing *atomic.Bool) func(*os.File, []byte) (int, error) {
+	return func(f *os.File, b []byte) (int, error) {
+		if failing.Load() && !isSegment(f) {
 			return 0, syscall.ENOSPC
 		}
 		return f.Write(b)
@@ -179,5 +198,43 @@ func TestDiskFullDoesNotCorruptTheLog(t *testing.T) {
 			t.Fatalf("record %d replayed as %q, want %q; the log lost or reordered records around the failures",
 				i, got[i], accepted[i])
 		}
+	}
+}
+
+// A full disk stops the log claiming sequence numbers, which happens before a
+// record is staged rather than during the commit. That failure has to reach the
+// backpressure policy like any other: returning it raw would skip Reject,
+// DropOldest, Block, the disk-full metric, and the retry once space comes back.
+func TestDiskFullWhileReservingRunsThePolicy(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true) // fails the first reservation, on the first write
+
+	b := openBuf(t, t.TempDir(), &recorder{}, fast(
+		WithOnFull(Reject()),
+		withWriteFault(enospcReserving(&failing)),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	err := b.Write(context.Background(), "no room to number this")
+	if !errors.Is(err, ErrDiskFull) {
+		t.Fatalf("Write that could not reserve an LSN = %v, want ErrDiskFull", err)
+	}
+	if s := b.Stats(); s.DiskFullEvents == 0 {
+		t.Fatal("Stats.DiskFullEvents is 0; a reservation that hit a full disk must be visible in metrics")
+	}
+
+	// And it is transient: once there is room, the same buffer works.
+	failing.Store(false)
+	if err := b.Write(context.Background(), "room now"); err != nil {
+		t.Fatalf("Write after space came back: %v", err)
+	}
+	fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
 }

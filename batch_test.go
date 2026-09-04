@@ -714,9 +714,13 @@ func TestOldestAgeReflectsDeliveryProgress(t *testing.T) {
 	sink.delay.Store(int64(3 * time.Millisecond)) // keep the backlog nonempty
 	b := openBuf(t, t.TempDir(), sink, fast()...)
 	ctx := context.Background()
+	// Closed on every path: a buffer left running writes into the directory
+	// while the test framework is removing it.
+	defer b.Close(ctx)
 
+	const load = 600 * time.Millisecond
 	start := time.Now()
-	for time.Since(start) < 600*time.Millisecond {
+	for time.Since(start) < load {
 		if err := b.Write(ctx, "x"); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
@@ -724,12 +728,20 @@ func TestOldestAgeReflectsDeliveryProgress(t *testing.T) {
 	}
 	// The backlog was never empty, but records kept flushing, so the oldest
 	// pending record is recent. Measuring "time since the backlog was last
-	// empty" would report ~600ms here.
-	if age := b.Stats().OldestAge; age > 300*time.Millisecond {
-		t.Fatalf("OldestAge = %v under continuous load; the oldest pending record is far younger", age)
+	// empty" would report the whole run here.
+	if age := b.Stats().OldestAge; age >= load {
+		t.Fatalf("OldestAge = %v after %v of continuous load; it is measuring the backlog's lifetime, not the oldest record's", age, load)
 	}
-	if err := b.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
+
+	// And once everything is delivered it must read as nothing pending, even
+	// though writers and the flusher were racing to note and trim marks.
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if s := b.Stats(); s.PendingRecords == 0 && s.OldestAge != 0 {
+		t.Fatalf("OldestAge = %v with an empty backlog: a mark outlived the record it was for", s.OldestAge)
 	}
 }
 
@@ -819,5 +831,57 @@ func TestBatchesHoldConsecutiveRecords(t *testing.T) {
 		if got.ID != w.id || !slices.Equal(got.Records, w.records) {
 			t.Fatalf("batch %d = {ID:%d %v}, want {ID:%d %v}", i, got.ID, got.Records, w.id, w.records)
 		}
+	}
+}
+
+// The floor names the oldest record still wanted. A batch's acknowledgement
+// range starts below its first record whenever LSNs in front of it carried no
+// record — dropped ones, or the gap recovery leaves — and a floor raised into
+// that stretch must not take the batch with it.
+func TestFloorSparesBatchesWhoseRecordsAreAllAboveIt(t *testing.T) {
+	sink := &recorder{}
+	b := openBuf(t, t.TempDir(), sink, fast(WithFlush(2, 1<<20, 10*time.Millisecond))...)
+	ctx := context.Background()
+
+	// As DropOldest would have left it: LSN 1 is shed, everything from 2 is
+	// still wanted. The batch that follows holds LSNs 2 and 3, but its
+	// acknowledgement range starts at 1, because somebody has to account for the
+	// record that was dropped.
+	b.floor.Store(2)
+	for _, rec := range []string{"shed", "a", "b"} {
+		if err := b.Write(ctx, rec); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	closeBuf(t, b)
+
+	if got := sink.seen(); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("sink got %v, want [a b]: a batch whose records are all at or above the floor was thrown away with the range in front of it", got)
+	}
+	if s := b.Stats(); s.Dropped != 1 {
+		t.Fatalf("Stats.Dropped = %d, want 1 — only the record below the floor", s.Dropped)
+	}
+}
+
+func TestAgeTrackerIgnoresMarksForDeliveredRecords(t *testing.T) {
+	var a ageTracker
+	now := time.Now().UnixNano()
+	a.trim(10) // LSNs up to 10 are downstream
+
+	// A writer that was slow to record its mark must not resurrect them.
+	a.note(10, now-int64(time.Hour))
+	if got := a.oldest(now); got != 0 {
+		t.Fatalf("oldest = %v after a late mark for an acknowledged LSN, want 0", got)
+	}
+	// A genuinely newer record still registers.
+	a.note(11, now)
+	if got := a.oldest(now + int64(time.Second)); got != time.Second {
+		t.Fatalf("oldest = %v, want 1s", got)
 	}
 }

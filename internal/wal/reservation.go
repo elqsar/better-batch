@@ -23,13 +23,18 @@ const reserveBlock = 1 << 20
 // the log therefore resumes above this mark rather than renumbering from the
 // surviving tail. Written to a temporary file and renamed, so a crash leaves
 // either the old value or the new one.
-func writeReserved(dir string, lsn uint64) error {
+func (l *Log) writeReserved(lsn uint64) error {
+	dir := l.dir
 	tmp := filepath.Join(dir, reservedName+".tmp")
 	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(f, "%d\n", lsn); err != nil {
+	write := f.Write
+	if l.opts.WriteFunc != nil {
+		write = func(b []byte) (int, error) { return l.opts.WriteFunc(f, b) }
+	}
+	if _, err := write(fmt.Appendf(nil, "%d\n", lsn)); err != nil {
 		f.Close()
 		return err
 	}
