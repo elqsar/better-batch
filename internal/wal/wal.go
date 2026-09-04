@@ -241,7 +241,6 @@ func (l *Log) recover() error {
 			return err
 		}
 		l.segs = append(l.segs, s)
-		l.durable = 0
 
 	default:
 		tail := l.segs[len(l.segs)-1].lastLSN()
@@ -263,12 +262,15 @@ func (l *Log) recover() error {
 			}
 			last.f = f
 		}
-		l.durable = tail
 	}
 
 	l.active = l.segs[len(l.segs)-1]
 	l.firstLSN = l.segs[0].baseLSN
 	l.nextLSN = l.active.baseLSN + l.active.count
+	// Durability is about records, not about how far the numbering has moved:
+	// the segment recovery opens above the reservation is empty, and on a later
+	// reopen its position would otherwise be mistaken for a durable record.
+	l.durable = lastRecordLSN(l.segs)
 	return nil
 }
 
@@ -687,15 +689,20 @@ func (l *Log) Close() error {
 	l.mu.Lock()
 	err := l.closeErr
 	active := l.active
-	durable, reserved := l.durable, l.reserved
+	allocated, reserved := l.nextLSN-1, l.reserved
 	l.mu.Unlock()
 
 	// A clean shutdown knows exactly which LSNs were used, so it gives the
 	// unused remainder of the block back. Without this every restart would skip
 	// a block, and the numbering of a log that was closed properly should just
 	// continue.
-	if reserved > durable {
-		if rerr := l.writeReserved(durable); err == nil {
+	//
+	// What it gives back is bounded by what was handed out, not by what was
+	// written: an empty segment opened above the reservation has already claimed
+	// its base, so lowering the mark past it would let a later run believe those
+	// numbers are still free.
+	if reserved > allocated {
+		if rerr := l.writeReserved(allocated); err == nil {
 			err = rerr
 		}
 	}

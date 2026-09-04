@@ -908,3 +908,77 @@ func TestFailedRotationCanBeRetried(t *testing.T) {
 		}
 	}
 }
+
+// Recovery opens an empty segment above the reservation. Its position in the
+// numbering is not a record, and a later reopen must not mistake it for one: a
+// log that claims records nobody can read leaves every reader waiting for them.
+func TestReopeningAnUnusedRecoverySegmentKeepsDurableHonest(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 {
+		if _, err := l.Append(context.Background(), payload(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segs, _ := filepath.Glob(filepath.Join(dir, "*"+segmentSuffix))
+	sort.Strings(segs)
+	st, err := os.Stat(segs[len(segs)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(segs[len(segs)-1], st.Size()/3); err != nil {
+		t.Fatal(err)
+	}
+
+	// This reopen creates the empty segment; nothing is written into it.
+	l2, err := Open(dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lsns, _ := readAll(t, l2, 0)
+	survived := lsns[len(lsns)-1]
+	if got := l2.DurableLSN(); got != survived {
+		t.Fatalf("DurableLSN = %d but the last record anyone can read is %d", got, survived)
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l3 := open(t, dir, Options{SyncMode: SyncNever, CommitBytes: 1})
+	if got := l3.DurableLSN(); got != survived {
+		t.Fatalf("DurableLSN = %d after reopening an unused recovery segment, want %d: its position in the numbering was counted as durable records", got, survived)
+	}
+	if got, _ := readAll(t, l3, 0); uint64(len(got)) != survived {
+		t.Fatalf("read back %d records, want the %d that survived", len(got), survived)
+	}
+}
+
+// O_EXCL keeps a segment holding records from being reopened as a new one, but
+// it also means a file left behind by a failed attempt would block that name for
+// good. An empty one is cleared out of the way; anything with bytes in it is not.
+func TestCreateSegmentClearsAnOrphanButNotARealSegment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, segmentName(7, 6))
+
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := createSegment(dir, 7, 6)
+	if err != nil {
+		t.Fatalf("createSegment over an empty orphan: %v; the name stays blocked and the log can never rotate", err)
+	}
+	s.f.Close()
+
+	if err := os.WriteFile(path, []byte("a record lives here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createSegment(dir, 7, 6); err == nil {
+		t.Fatal("createSegment took over a segment that holds data")
+	}
+}

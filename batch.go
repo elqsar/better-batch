@@ -129,14 +129,21 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 		log.Close()
 		return nil, err
 	}
-	// A checkpoint can outlive the records it refers to: it is always fsynced,
-	// while under SyncNever the records are not. After a machine crash the mark
-	// can therefore point past the end of the recovered log. Nothing is lost — a
-	// mark of N means every LSN at or below N was already acked by the sink — but
-	// leaving it ahead would start the flusher above every LSN the log is about
-	// to hand out, so new writes would sit unread until capacity wedged.
-	if durable := log.DurableLSN(); checkpoint > durable {
-		checkpoint = durable
+	// The mark has to name a place the log can actually resume from, and it can
+	// arrive outside that range from either end.
+	//
+	// Too high: the checkpoint is always fsynced while SyncNever records are not,
+	// so after a machine crash it can point past everything that survived.
+	// Starting the flusher above every LSN the log is about to hand out would
+	// leave new writes unread until capacity wedged.
+	//
+	// Too low: records at or below the mark have been delivered and deleted, and
+	// asking to read them back gets ErrTruncated rather than a fresh start.
+	// Nothing is lost either way — a mark of N means every LSN at or below N was
+	// already acked, and nothing below the log's first LSN exists to deliver.
+	checkpoint = min(checkpoint, log.DurableLSN())
+	if first := log.FirstLSN(); first > 0 {
+		checkpoint = max(checkpoint, first-1)
 	}
 	// Everything at or below the checkpoint is already downstream.
 	if err := log.Truncate(checkpoint + 1); err != nil {
@@ -450,9 +457,10 @@ func (b *Buffer[T]) dropOldest(n, size int64) {
 	// Free room for this write plus headroom, so a stream of writes against a
 	// dead sink does not re-enter the policy for every single record.
 	//
-	// The floor is an LSN but want is a record count, and the two only agree
-	// where the numbering is dense. Across the gap left by a recovery this sheds
-	// more than asked for, which is within what a drop policy promises.
+	// Counting LSNs off from the mark works because the flusher acknowledges
+	// stretches that carry no record as soon as it reaches them: the mark is
+	// always just below the oldest record still pending, and the records above
+	// it are consecutive.
 	want := min(max(n+n/4+1, size/avg), records)
 	b.raiseFloor(b.acks.mark() + 1 + uint64(want))
 	b.nudge()

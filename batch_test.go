@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -883,5 +885,117 @@ func TestAgeTrackerIgnoresMarksForDeliveredRecords(t *testing.T) {
 	a.note(11, now)
 	if got := a.oldest(now + int64(time.Second)); got != time.Second {
 		t.Fatalf("oldest = %v, want 1s", got)
+	}
+}
+
+// tornReopen writes a few records, closes, and chops the last segment so that
+// reopening leaves the gap in the numbering that recovery makes when it cannot
+// tell which LSNs already went downstream.
+func tornReopen(t *testing.T, dir string) {
+	t.Helper()
+	sink := &recorder{}
+	b := openBuf(t, dir, sink, fast(WithSync(SyncAlways, 0))...)
+	ctx := context.Background()
+	for i := range 5 {
+		if err := b.Write(ctx, fmt.Sprintf("old-%d", i)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	closeBuf(t, b)
+
+	segs, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("no segments in %s: %v", dir, err)
+	}
+	slices.Sort(segs)
+	last := segs[len(segs)-1]
+	st, err := os.Stat(last)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(last, st.Size()/2); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// DropOldest has to keep freeing capacity after a recovery gap. The records it
+// shed are counted off from the acknowledged mark, and if that mark stays parked
+// below a stretch that holds nothing, the policy sheds nothing at all and every
+// writer waits for a sink that is never coming back.
+func TestDropOldestKeepsWorkingAcrossARecoveryGap(t *testing.T) {
+	dir := t.TempDir()
+	tornReopen(t, dir)
+
+	dead := &recorder{}
+	dead.failAll.Store(true)
+	b := openBuf(t, dir, dead, fast(
+		WithCapacity(8, 0),
+		WithOnFull(DropOldest()),
+		WithRetry(Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Jitter: 0}, 0),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	// Well past the capacity, against a sink that never accepts anything.
+	// DropOldest must never park a writer.
+	for i := range 40 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := b.Write(ctx, fmt.Sprintf("new-%d", i))
+		cancel()
+		if err != nil {
+			t.Fatalf("write %d: %v; DropOldest stopped freeing capacity after the recovery gap", i, err)
+		}
+	}
+}
+
+// The other half of the same behaviour, stated directly: the mark moves past a
+// stretch that carries no record without waiting for a delivery, because
+// nothing in that stretch can ever be delivered.
+func TestRecoveryGapIsAcknowledgedWithoutDelivery(t *testing.T) {
+	dir := t.TempDir()
+	tornReopen(t, dir)
+
+	dead := &recorder{}
+	dead.failAll.Store(true)
+	b := openBuf(t, dir, dead, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Jitter: 0}, 0),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	before := b.Stats().Checkpoint
+	if err := b.Write(context.Background(), "after the gap"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Nothing is ever delivered, so any progress in the mark is the empty
+	// stretch being accounted for.
+	waitFor(t, 5*time.Second, func() bool { return b.Stats().Checkpoint > before })
+	if s := b.Stats(); s.Flushed != 0 {
+		t.Fatalf("Stats.Flushed = %d, want 0: the sink never accepted anything", s.Flushed)
+	}
+}
+
+// Opening a buffer after a crash and closing it again without writing leaves a
+// recovery segment that holds nothing. Flush must not then wait for records
+// that were never written.
+func TestFlushReturnsAfterAnUnusedRecoveryReopen(t *testing.T) {
+	dir := t.TempDir()
+	tornReopen(t, dir)
+
+	closeBuf(t, openBuf(t, dir, &recorder{}, fast()...)) // opens the gap, writes nothing
+
+	sink := &recorder{}
+	b := openBuf(t, dir, sink, fast()...)
+	defer closeBuf(t, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v; it is waiting for records the recovery segment never held", err)
 	}
 }

@@ -24,9 +24,13 @@ func Example() {
 
 	// A sink receives batches. Returning nil means the records are safely
 	// downstream and the buffer may forget them.
-	flushed := make(chan int, 64)
+	//
+	// Whatever a sink does, it must not block on something only the caller can
+	// release: the buffer waits for the sink, so a full channel nobody is
+	// draining yet would stop Close from ever returning.
+	var delivered atomic.Int64
 	sink := batch.SinkFunc[Event](func(ctx context.Context, b batch.Batch[Event]) error {
-		flushed <- b.Len()
+		delivered.Add(int64(b.Len()))
 		return nil
 	})
 
@@ -55,12 +59,7 @@ func Example() {
 		panic(err)
 	}
 
-	close(flushed)
-	total := 0
-	for n := range flushed {
-		total += n
-	}
-	fmt.Println("delivered", total)
+	fmt.Println("delivered", delivered.Load())
 	// Output: delivered 250
 }
 

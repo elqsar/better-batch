@@ -55,10 +55,24 @@ func (b *Buffer[T]) flusher(from uint64) {
 		hasHeld  bool
 	)
 
+	// startBatch opens a batch at lsn, first acknowledging the stretch in front
+	// of it. Those LSNs carry no record — they were dropped, or they are the gap
+	// recovery left — so nothing is lost by handling them now, and waiting would
+	// leave the low-water mark parked below a stretch that will never be
+	// delivered. That mark is what DropOldest measures the backlog from.
+	startBatch := func(lsn uint64) {
+		if lsn > rangeFrom {
+			b.complete(rangeFrom, lsn-1, 0, 0)
+			rangeFrom = lsn
+		}
+		id, wantLSN = lsn, lsn
+	}
+
 	for {
 		if hasHeld && len(records) == 0 {
+			startBatch(heldLSN)
 			records = append(records, held)
-			id, wantLSN = heldLSN, heldLSN+1
+			wantLSN = heldLSN + 1
 			nbytes += heldSize
 			rangeTo = heldLSN
 			hasHeld = false
@@ -101,7 +115,7 @@ func (b *Buffer[T]) flusher(from uint64) {
 				continue
 			}
 			if len(records) == 0 {
-				id, wantLSN = lsn, lsn
+				startBatch(lsn)
 			}
 			if lsn != wantLSN {
 				held, heldLSN, heldSize, hasHeld = v, lsn, size, true

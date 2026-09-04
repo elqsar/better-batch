@@ -38,8 +38,23 @@ type segment struct {
 	count uint64
 }
 
-// lastLSN returns the LSN of the final record, or baseLSN-1 when empty.
+// lastLSN returns the LSN of the final record, or baseLSN-1 when empty. It is a
+// position in the numbering, not a record: use lastRecordLSN when the question
+// is which records exist.
 func (s *segment) lastLSN() uint64 { return s.baseLSN + s.count - 1 }
+
+// lastRecordLSN returns the LSN of the newest record the segments hold, or 0
+// when they hold none. An empty segment — the one recovery opens above the
+// reservation — reports a lastLSN that names no record, and taking that for the
+// durable end would leave the log claiming records nobody can ever read.
+func lastRecordLSN(segs []*segment) uint64 {
+	for i := len(segs) - 1; i >= 0; i-- {
+		if segs[i].count > 0 {
+			return segs[i].lastLSN()
+		}
+	}
+	return 0
+}
 
 // segmentName is baseLSN and prevEnd, both zero-padded so that sorting names
 // sorts by LSN.
@@ -67,17 +82,32 @@ func parseSegmentName(name string) (baseLSN, prevEnd uint64, ok bool) {
 }
 
 // createSegment creates and opens a new empty segment that follows prevEnd.
+//
+// O_EXCL is the guard that a segment holding records is never reopened as a new
+// one. The cost is that a file left behind by a failed attempt blocks the name
+// for good, so an empty one is cleared out of the way first: it can hold no
+// record, and a segment the log actually knows about is never re-created.
 func createSegment(dir string, baseLSN, prevEnd uint64) (*segment, error) {
 	path := filepath.Join(dir, segmentName(baseLSN, prevEnd))
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
+	if errors.Is(err, os.ErrExist) {
+		if st, serr := os.Stat(path); serr == nil && st.Size() == 0 {
+			if rerr := os.Remove(path); rerr == nil {
+				f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
+	s := &segment{baseLSN: baseLSN, prevEnd: prevEnd, path: path, f: f}
 	if err := syncDir(dir); err != nil {
-		f.Close()
+		// The file exists but the log will not know about it, and the retry
+		// would find the name taken.
+		s.discard()
 		return nil, err
 	}
-	return &segment{baseLSN: baseLSN, prevEnd: prevEnd, path: path, f: f}, nil
+	return s, nil
 }
 
 // discard closes a segment and removes its file. It is for a segment that was
