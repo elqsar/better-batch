@@ -231,6 +231,16 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 		b.sinkFailures.Add(1)
 		b.counters.retries.Add(1)
 
+		select {
+		case <-b.abort:
+			// Close cancelled the delivery context, so this error is the
+			// shutdown talking, not the sink's verdict on the batch. Retries
+			// are not exhausted and the records are not dead letters: leave the
+			// range unacknowledged and let the next open replay it.
+			return
+		default:
+		}
+
 		if b.cfg.maxAttempts > 0 && attempt >= b.cfg.maxAttempts {
 			b.deadLetter(batch, p)
 			return
@@ -264,11 +274,17 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 	b.complete(p.rangeFrom, p.rangeTo, p.count, p.bytes)
 }
 
-// complete marks an LSN range as handled and gives its capacity back.
+// complete marks an LSN range as handled and gives back the capacity the
+// low-water mark has moved past.
+//
+// A range acknowledged ahead of the mark keeps holding its capacity: the log
+// cannot be truncated below the mark, so those records are still on disk, and
+// releasing them would let the configured capacity admit writes without bound
+// while one stuck batch pins the mark in place.
 func (b *Buffer[T]) complete(from, to uint64, count, bytes int64) {
-	mark := b.acks.ack(from, to)
+	mark, freedCount, freedBytes := b.acks.ack(from, to, count, bytes)
 	b.ages.trim(mark)
-	b.release(count, bytes)
+	b.release(freedCount, freedBytes)
 	b.progress.signal()
 }
 

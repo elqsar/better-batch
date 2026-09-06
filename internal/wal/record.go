@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"io"
 )
 
 // headerSize is the size of the per-record header: a uint32 payload length
@@ -21,6 +22,21 @@ func checksum(lenField uint32, payload []byte) uint32 {
 	h.Write(b[:])
 	h.Write(payload)
 	return h.Sum32()
+}
+
+// matchesChecksum verifies a record by streaming its payload out of r, for the
+// one case where the payload cannot simply be read into memory: a length field
+// above the configured limit, which is either corrupt or a record written when
+// the limit was larger.
+func matchesChecksum(r io.Reader, length, crc uint32) bool {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], length)
+	h := crc32.New(crcTable)
+	h.Write(b[:])
+	if _, err := io.CopyN(h, r, int64(length)); err != nil {
+		return false
+	}
+	return h.Sum32() == crc
 }
 
 // appendRecord encodes payload as a framed record and appends it to dst.

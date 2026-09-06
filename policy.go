@@ -71,7 +71,9 @@ type State struct {
 	DiskFull bool
 
 	// Attempt counts how many times this particular write has been reconsidered
-	// after blocking, so a policy can block for a while and then give up.
+	// after blocking, so a policy can block for a while and then give up. A
+	// blocked write is reconsidered when capacity is released and on a timer, so
+	// the count grows even while the sink is doing nothing at all.
 	Attempt int
 }
 
@@ -107,6 +109,10 @@ func DropOldest() Policy { return constant(DecisionDropOldest) }
 // starts shedding the backlog. It is a reasonable default for telemetry: a
 // brief sink hiccup applies backpressure, a sustained outage does not take the
 // application down with it.
+//
+// The grace period is approximate: it is measured when the buffer reconsiders a
+// blocked write, which it does on a timer as well as whenever capacity is
+// released, so shedding starts within a few milliseconds of the deadline.
 func BlockThenDropOldest(grace time.Duration) Policy {
 	return PolicyFunc(func(_ context.Context, s State) Decision {
 		if s.OldestAge > grace {

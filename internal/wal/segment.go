@@ -129,6 +129,10 @@ func (s *segment) discard() {
 // record with intact data after it cannot be a tear: it is interior corruption,
 // and silently truncating there would discard durable records the writer was
 // told were safe, so it is reported as ErrCorrupt instead.
+//
+// A record longer than maxRecordBytes whose checksum verifies is neither: it is
+// a record written while the limit was larger. Lowering MaxRecordBytes must not
+// quietly delete it, so that is ErrRecordTooLarge rather than a truncation.
 func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, truncated bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -160,10 +164,20 @@ func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, tru
 		}
 		length, crc := decodeHeader(hdr)
 		if length > uint32(maxRecordBytes) {
-			// The length field itself is corrupt, so the next record boundary is
-			// unrecoverable either way: whatever follows cannot be re-framed.
-			// This is indistinguishable from a torn header, so it stays a
-			// truncation rather than an error.
+			// A length above the limit is either a corrupt field or a record
+			// written when MaxRecordBytes was larger, and only the checksum can
+			// tell them apart. The difference decides between cutting a tail
+			// away and deleting durable records because the configuration
+			// changed, so it is worth reading the payload to find out. A record
+			// that does not fit in the file cannot be real, which is what keeps
+			// a corrupt length from making recovery read anything large.
+			if good+recordSize(int(length)) <= total && matchesChecksum(r, length, crc) {
+				return 0, 0, false, fmt.Errorf("%w: %s: record at offset %d is %d bytes, above the configured MaxRecordBytes of %d",
+					ErrRecordTooLarge, path, good, length, maxRecordBytes)
+			}
+			// The next record boundary is unrecoverable either way: whatever
+			// follows cannot be re-framed. This is indistinguishable from a torn
+			// header, so it stays a truncation rather than an error.
 			return count, good, true, nil
 		}
 		if cap(payload) < int(length) {
