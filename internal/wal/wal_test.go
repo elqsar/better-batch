@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -434,6 +435,42 @@ func TestRecordTooLarge(t *testing.T) {
 	l := open(t, t.TempDir(), Options{MaxRecordBytes: 64})
 	if _, err := l.Append(context.Background(), make([]byte, 65)); !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("Append oversized = %v, want ErrRecordTooLarge", err)
+	}
+}
+
+// errReader yields its bytes and then fails, standing in for storage that goes
+// bad underneath a segment.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestMatchesChecksumPropagatesReadErrors(t *testing.T) {
+	body := []byte("a record recovery never gets to the end of")
+	crc := checksum(uint32(len(body)), body)
+	length := uint32(len(body))
+
+	failing := errors.New("input/output error")
+	if ok, err := matchesChecksum(&errReader{data: body[:8], err: failing}, length, crc); ok || !errors.Is(err, failing) {
+		t.Fatalf("matchesChecksum over a failing reader = (%v, %v), want (false, the read error): storage failing is not a torn tail", ok, err)
+	}
+
+	// A payload that merely ends early is an answer, not a failure: there is no
+	// whole record there.
+	if ok, err := matchesChecksum(&errReader{data: body[:8], err: io.EOF}, length, crc); ok || err != nil {
+		t.Fatalf("matchesChecksum over a short payload = (%v, %v), want (false, nil)", ok, err)
+	}
+	if ok, err := matchesChecksum(&errReader{data: body, err: io.EOF}, length, crc); !ok || err != nil {
+		t.Fatalf("matchesChecksum over the whole record = (%v, %v), want (true, nil)", ok, err)
 	}
 }
 

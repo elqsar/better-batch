@@ -171,9 +171,15 @@ func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, tru
 			// changed, so it is worth reading the payload to find out. A record
 			// that does not fit in the file cannot be real, which is what keeps
 			// a corrupt length from making recovery read anything large.
-			if good+recordSize(int(length)) <= total && matchesChecksum(r, length, crc) {
-				return 0, 0, false, fmt.Errorf("%w: %s: record at offset %d is %d bytes, above the configured MaxRecordBytes of %d",
-					ErrRecordTooLarge, path, good, length, maxRecordBytes)
+			if good+recordSize(int(length)) <= total {
+				ok, err := matchesChecksum(r, length, crc)
+				if err != nil {
+					return 0, 0, false, err
+				}
+				if ok {
+					return 0, 0, false, fmt.Errorf("%w: %s: record at offset %d is %d bytes, above the configured MaxRecordBytes of %d",
+						ErrRecordTooLarge, path, good, length, maxRecordBytes)
+				}
 			}
 			// The next record boundary is unrecoverable either way: whatever
 			// follows cannot be re-framed. This is indistinguishable from a torn

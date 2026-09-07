@@ -573,11 +573,10 @@ wedging the pipeline behind it.
   context can still stall shutdown.
 - **Sizing:** `WithCapacity` bounds the backlog on disk, so it is the number that decides how
   long an outage you can ride out. At 1 KiB per event, 1 GiB is roughly a million events. It
-  counts every record the log still holds, including ones the sink has already taken: with
-  `WithMaxInFlight` above 1 a batch that never completes pins the low-water mark, and the
-  records acknowledged behind it stay on disk and keep holding their capacity until it lands.
-  Records dropped by policy or a decode failure give theirs back as the flusher reads past
-  them.
+  counts every record the log still holds, whatever became of it: with `WithMaxInFlight`
+  above 1 a batch that never completes pins the low-water mark, and everything behind it —
+  records the sink has already taken, records dropped by policy, records that would not
+  decode — stays on disk and keeps holding its capacity until that batch lands.
 
 ## Design notes
 

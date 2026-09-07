@@ -2,6 +2,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"io"
 )
@@ -28,15 +29,23 @@ func checksum(lenField uint32, payload []byte) uint32 {
 // one case where the payload cannot simply be read into memory: a length field
 // above the configured limit, which is either corrupt or a record written when
 // the limit was larger.
-func matchesChecksum(r io.Reader, length, crc uint32) bool {
+//
+// A payload that ends early is not a record, which is the same answer as a
+// checksum that does not match. Any other read failure is the storage talking
+// and is returned, because recovery must not mistake it for a torn tail and cut
+// the segment there.
+func matchesChecksum(r io.Reader, length, crc uint32) (bool, error) {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], length)
 	h := crc32.New(crcTable)
 	h.Write(b[:])
 	if _, err := io.CopyN(h, r, int64(length)); err != nil {
-		return false
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
 	}
-	return h.Sum32() == crc
+	return h.Sum32() == crc, nil
 }
 
 // appendRecord encodes payload as a framed record and appends it to dst.

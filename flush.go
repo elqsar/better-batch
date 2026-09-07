@@ -20,6 +20,13 @@ type pending[T any] struct {
 	rangeTo   uint64
 	count     int64
 	bytes     int64
+
+	// skipCount and skipBytes are the records inside the range that will not be
+	// delivered. They are counted apart from count and bytes, which describe the
+	// batch itself, but their capacity comes back with the rest of the range:
+	// until it is acknowledged they are still in the log.
+	skipCount int64
+	skipBytes int64
 }
 
 // flusher reads the log, assembles batches, and hands them to the sink.
@@ -43,6 +50,8 @@ func (b *Buffer[T]) flusher(from uint64) {
 		rangeFrom = from
 		rangeTo   = from - 1
 		nbytes    int64
+		skipCount int64 // records inside the range that will not be delivered
+		skipBytes int64
 		expired   bool
 		draining  bool
 		cut       bool // a discontinuity ends this batch early
@@ -62,8 +71,9 @@ func (b *Buffer[T]) flusher(from uint64) {
 	// delivered. That mark is what DropOldest measures the backlog from.
 	startBatch := func(lsn uint64) {
 		if lsn > rangeFrom {
-			b.complete(rangeFrom, lsn-1, 0, 0)
+			b.complete(rangeFrom, lsn-1, skipCount, skipBytes)
 			rangeFrom = lsn
+			skipCount, skipBytes = 0, 0
 		}
 		id, wantLSN = lsn, lsn
 	}
@@ -93,13 +103,11 @@ func (b *Buffer[T]) flusher(from uint64) {
 			skip := false
 			if lsn < b.floor.Load() {
 				b.dropped(1, ReasonPolicy)
-				b.release(1, size)
 				skip = true
 			} else if decoded, derr := b.codec.Decode(payload); derr != nil {
 				// A record that will not decode can never be delivered.
 				// Dropping it is the only alternative to wedging the pipeline.
 				b.dropped(1, ReasonDecode)
-				b.release(1, size)
 				skip = true
 			} else {
 				v = decoded
@@ -110,7 +118,12 @@ func (b *Buffer[T]) flusher(from uint64) {
 			// A dropped record, or a gap left behind by recovery, therefore ends
 			// the batch rather than opening a hole in it.
 			if skip {
-				rangeTo = lsn // the range still covers what was dropped
+				// The range still covers what was dropped, and so does its
+				// capacity: the record stays in the log until the range is
+				// acknowledged, however little anyone wants it now.
+				rangeTo = lsn
+				skipCount++
+				skipBytes += size
 				cut = len(records) > 0
 				continue
 			}
@@ -143,18 +156,22 @@ func (b *Buffer[T]) flusher(from uint64) {
 				rangeTo:   rangeTo,
 				count:     int64(len(records)),
 				bytes:     nbytes,
+				skipCount: skipCount,
+				skipBytes: skipBytes,
 			}) {
 				return // aborted: the range stays unacknowledged and replays
 			}
 			records, nbytes, expired, cut = records[:0], 0, false, false
 			rangeFrom = rangeTo + 1
+			skipCount, skipBytes = 0, 0
 			continue
 		}
 
 		if len(records) == 0 && rangeTo >= rangeFrom {
 			// The whole range was skipped. Acknowledge it directly.
-			b.complete(rangeFrom, rangeTo, 0, 0)
+			b.complete(rangeFrom, rangeTo, skipCount, skipBytes)
 			rangeFrom = rangeTo + 1
+			skipCount, skipBytes = 0, 0
 			cut = false
 			continue
 		}
@@ -208,7 +225,7 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			// only be abandoned whole, which also frees the delivery slot the
 			// flusher may be waiting on.
 			b.dropped(int(p.count), ReasonPolicy)
-			b.complete(p.rangeFrom, p.rangeTo, p.count, p.bytes)
+			b.completeRange(p)
 			return
 		}
 		batch.Attempt = attempt
@@ -225,33 +242,47 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 		if err == nil {
 			b.sinkFailures.Store(0)
 			b.counters.flushed.Add(uint64(p.count))
-			b.complete(p.rangeFrom, p.rangeTo, p.count, p.bytes)
+			b.completeRange(p)
 			return
 		}
 		b.sinkFailures.Add(1)
 		b.counters.retries.Add(1)
 
-		select {
-		case <-b.abort:
+		if b.aborting() {
 			// Close cancelled the delivery context, so this error is the
 			// shutdown talking, not the sink's verdict on the batch. Retries
 			// are not exhausted and the records are not dead letters: leave the
 			// range unacknowledged and let the next open replay it.
 			return
-		default:
 		}
 
 		if b.cfg.maxAttempts > 0 && attempt >= b.cfg.maxAttempts {
 			b.deadLetter(batch, p)
 			return
 		}
+		// The backoff also ends when DropOldest raises the floor over this
+		// batch: a writer is waiting for the capacity the batch holds, and only
+		// the abandon at the top of this loop can give it back. Waiting out a
+		// retry delay first would leave a policy that exists never to block
+		// blocking for as long as the backoff has grown.
 		timer := time.NewTimer(b.cfg.backoff.delay(attempt))
-		select {
-		case <-timer.C:
-		case <-b.abort:
-			timer.Stop()
-			return // unacknowledged, so the batch is replayed after restart
+		for waiting := true; waiting; {
+			// Take the gate before reading the floor, so a raise between the
+			// two cannot be missed.
+			shed := b.floors.wait()
+			if p.id < b.floor.Load() {
+				break
+			}
+			select {
+			case <-timer.C:
+				waiting = false
+			case <-shed:
+			case <-b.abort:
+				timer.Stop()
+				return // unacknowledged, so the batch is replayed after restart
+			}
 		}
+		timer.Stop()
 	}
 }
 
@@ -260,7 +291,15 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 	case b.dlq == nil:
 		b.dropped(int(p.count), ReasonRetriesExhausted)
 	default:
-		if err := b.dlq.Flush(b.deliverCtx, batch); err != nil {
+		err := b.dlq.Flush(b.deliverCtx, batch)
+		if err != nil && b.aborting() {
+			// The dead-letter sink was cancelled by the shutdown, exactly as the
+			// primary one can be. The records have reached neither, so they are
+			// not dead letters yet: leave the range unacknowledged and let the
+			// next open replay it.
+			return
+		}
+		if err != nil {
 			// There is nothing left to try. Counting it beats blocking the
 			// pipeline on a dead-letter sink that is also down.
 			b.dropped(int(p.count), ReasonRetriesExhausted)
@@ -271,7 +310,26 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 			}
 		}
 	}
-	b.complete(p.rangeFrom, p.rangeTo, p.count, p.bytes)
+	b.completeRange(p)
+}
+
+// completeRange acknowledges everything the batch's range covers: its own
+// records and the skipped ones inside it, which sit in the log holding capacity
+// until the range is done with.
+func (b *Buffer[T]) completeRange(p pending[T]) {
+	b.complete(p.rangeFrom, p.rangeTo, p.count+p.skipCount, p.bytes+p.skipBytes)
+}
+
+// aborting reports whether Close has stopped waiting for deliveries. A sink
+// error that arrives after that is the shutdown talking, not the sink's verdict
+// on the batch.
+func (b *Buffer[T]) aborting() bool {
+	select {
+	case <-b.abort:
+		return true
+	default:
+		return false
+	}
 }
 
 // complete marks an LSN range as handled and gives back the capacity the

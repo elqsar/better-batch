@@ -64,6 +64,7 @@ type Buffer[T any] struct {
 
 	space    *gate // signalled when the backlog shrinks
 	progress *gate // signalled when the low-water mark advances
+	floors   *gate // signalled when DropOldest raises the floor
 
 	wake chan struct{} // nudges the flusher
 	sem  chan struct{} // bounds concurrent deliveries
@@ -161,6 +162,7 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 		acks:     newAckTracker(checkpoint),
 		space:    newGate(),
 		progress: newGate(),
+		floors:   newGate(),
 		wake:     make(chan struct{}, 1),
 		sem:      make(chan struct{}, cfg.maxInFlight),
 		closing:  make(chan struct{}),
@@ -491,7 +493,13 @@ func (b *Buffer[T]) dropOldest(n, size int64) {
 func (b *Buffer[T]) raiseFloor(to uint64) {
 	for {
 		cur := b.floor.Load()
-		if to <= cur || b.floor.CompareAndSwap(cur, to) {
+		if to <= cur {
+			return
+		}
+		if b.floor.CompareAndSwap(cur, to) {
+			// A delivery sitting out its backoff may now be below the floor,
+			// and it is the only one that can hand that capacity back.
+			b.floors.signal()
 			return
 		}
 	}

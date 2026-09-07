@@ -291,7 +291,8 @@ Two bugs the tests caught, both worth keeping in mind for the layers still to co
   dispatched to a failing sink, a writer blocked forever under a policy whose entire job is
   to never block. A batch in flight can only be abandoned whole, so that is what it does
   now — coarser than dropping single records, and the reason it is documented as
-  approximate.
+  approximate. Raising the floor also cuts that batch's retry backoff short, since the
+  abandon is what hands its capacity back and the backoff can have grown to half a minute.
 - **`Close` closed the log while the flusher was still reading it.** Only reachable when
   `Close`'s context expired first, which is exactly when a shutdown is already going badly.
   `Close` now waits for the flusher to actually stop before touching the log, always.
@@ -322,6 +323,24 @@ that each one is a case where two things that look alike are not:
   low-water mark, and nothing below the mark can be truncated. With `MaxInFlight` above 1,
   one stuck batch let writes carry on for ever while the log grew. Capacity is now released
   as the mark advances, which is the moment the space can actually come back.
+
+A follow-up review found three more, two of them in that round's own work. The theme is the
+same — two things that look alike and are not:
+
+- **A cancelled dead-letter call still counted as a verdict.** The shutdown check went into
+  the primary flush path but not into the dead-letter one, so a `Close` deadline that
+  cancelled the dead-letter sink dropped the batch and checkpointed past it. Both calls ask
+  the same question before disposing of anything now.
+- **Dropped records were exempted from that same accounting.** Skipped records — policy
+  drops, undecodable ones — released their capacity the moment the flusher read past them,
+  on the reasoning that the mark would follow immediately. It does not when something
+  earlier is stuck, which is precisely the case the accounting exists for, so the flusher
+  carries their counts into the range that acknowledges them. Exempting the easy case from
+  an invariant is how the invariant stops being one.
+- **The oversized-record check could not tell a read failure from a bad checksum.** The
+  helper that streams a too-long payload through the CRC turned every error into "not a
+  record", and recovery reads that as a torn tail — so an EIO would have truncated the
+  segment. It returns the error separately now, the way the neighbouring read already did.
 
 ### Where the time actually goes
 
