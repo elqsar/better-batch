@@ -64,6 +64,7 @@ type Buffer[T any] struct {
 
 	space    *gate // signalled when the backlog shrinks
 	progress *gate // signalled when the low-water mark advances
+	floors   *gate // signalled when DropOldest raises the floor
 
 	wake chan struct{} // nudges the flusher
 	sem  chan struct{} // bounds concurrent deliveries
@@ -161,6 +162,7 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 		acks:     newAckTracker(checkpoint),
 		space:    newGate(),
 		progress: newGate(),
+		floors:   newGate(),
 		wake:     make(chan struct{}, 1),
 		sem:      make(chan struct{}, cfg.maxInFlight),
 		closing:  make(chan struct{}),
@@ -344,6 +346,15 @@ func (b *Buffer[T]) onDiskFull(ctx context.Context, n, size int64, attempt int) 
 // before trying the log again.
 const diskFullRetryInterval = 100 * time.Millisecond
 
+// blockRetryFloor and blockRetryInterval bound how long a blocked writer waits
+// before its policy is consulted again. The wait starts at the floor and
+// doubles up to the interval: short enough that a brief grace period is still
+// honoured, long enough that a writer parked on a dead sink costs nothing.
+const (
+	blockRetryFloor    = time.Millisecond
+	blockRetryInterval = 100 * time.Millisecond
+)
+
 // enter registers a writer, unless the buffer has been sealed by Close.
 func (b *Buffer[T]) enter() error {
 	b.mu.Lock()
@@ -407,6 +418,7 @@ func (b *Buffer[T]) release(n, size int64) {
 // admit applies the backpressure policy until the write fits, is refused, or is
 // dropped. A false first return with a nil error means the policy dropped it.
 func (b *Buffer[T]) admit(ctx context.Context, n, size int64) (bool, error) {
+	wait := blockRetryFloor
 	for attempt := 1; ; attempt++ {
 		// Take the gate before testing capacity, so a release that happens
 		// between the test and the wait cannot be missed.
@@ -432,13 +444,23 @@ func (b *Buffer[T]) admit(ctx context.Context, n, size int64) (bool, error) {
 			b.dropOldest(n, size)
 		}
 
+		// The wait is bounded, not just gated on capacity coming back: a policy
+		// that blocks for a while and then sheds is only asked again when this
+		// loop wakes, and a sink that has stopped acknowledging anything
+		// releases nothing to wake it with.
+		timer := time.NewTimer(wait)
 		select {
 		case <-waiting:
+		case <-timer.C:
 		case <-ctx.Done():
+			timer.Stop()
 			return false, ctx.Err()
 		case <-b.closing:
+			timer.Stop()
 			return false, ErrClosed
 		}
+		timer.Stop()
+		wait = min(2*wait, blockRetryInterval)
 	}
 }
 
@@ -471,7 +493,13 @@ func (b *Buffer[T]) dropOldest(n, size int64) {
 func (b *Buffer[T]) raiseFloor(to uint64) {
 	for {
 		cur := b.floor.Load()
-		if to <= cur || b.floor.CompareAndSwap(cur, to) {
+		if to <= cur {
+			return
+		}
+		if b.floor.CompareAndSwap(cur, to) {
+			// A delivery sitting out its backoff may now be below the floor,
+			// and it is the only one that can hand that capacity back.
+			b.floors.signal()
 			return
 		}
 	}

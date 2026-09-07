@@ -451,6 +451,140 @@ func TestMaxInFlightAllowsConcurrentDelivery(t *testing.T) {
 	}
 }
 
+func TestDeadLetterCancelledByCloseKeepsRecords(t *testing.T) {
+	dir := t.TempDir()
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	var reached atomic.Bool
+	// The dead-letter sink honours its context and nothing else, so what ends
+	// its call is Close's deadline rather than any verdict on the batch.
+	dlq := SinkFunc[string](func(ctx context.Context, _ Batch[string]) error {
+		reached.Store(true)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	b := openBuf(t, dir, sink, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 1),
+		WithDeadLetter[string](dlq),
+	)...)
+
+	ctx := context.Background()
+	want := []string{"e0", "e1", "e2"}
+	for _, v := range want {
+		if err := b.Write(ctx, v); err != nil {
+			t.Fatalf("Write %s: %v", v, err)
+		}
+	}
+	waitFor(t, 5*time.Second, reached.Load)
+
+	cctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := b.Close(cctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close against a hung dead-letter sink = %v, want its deadline", err)
+	}
+	if s := b.Stats(); s.Dropped != 0 || s.DeadLettered != 0 {
+		t.Fatalf("Stats reports %d dropped and %d dead-lettered; a cancelled dead-letter call has not disposed of anything", s.Dropped, s.DeadLettered)
+	}
+
+	up := &recorder{}
+	b2 := openBuf(t, dir, up, fast()...)
+	defer closeBuf(t, b2)
+	waitFor(t, 5*time.Second, func() bool { return len(up.seen()) == len(want) })
+	if got := up.seen(); !slices.Equal(got, want) {
+		t.Fatalf("after reopening the sink saw %q, want %q: records neither sink took must replay", got, want)
+	}
+}
+
+func TestSkippedRecordsHoldCapacityUntilTheMarkMoves(t *testing.T) {
+	// The first batch never completes, so the mark cannot move and nothing can
+	// be truncated. Everything written after it fails to decode, and a record
+	// nobody will deliver is still a record in the log: its capacity has to stay
+	// held, or writes carry on for ever behind a checkpoint that never moves.
+	sink := SinkFunc[string](func(ctx context.Context, batch Batch[string]) error {
+		if batch.ID == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	})
+	b, err := Open[string](t.TempDir(), sink, poisonCodec{}, fast(
+		WithCapacity(4, 0),
+		WithFlush(2, 0, 5*time.Millisecond),
+		WithMaxInFlight(2),
+		WithOnFull(Reject()),
+	)...)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	ctx := context.Background()
+	accepted, full := 0, false
+	for i := range 40 {
+		v := "poison"
+		if i < 2 {
+			v = fmt.Sprintf("e%d", i) // the two that make the batch that sticks
+		}
+		switch err := b.Write(ctx, v); {
+		case err == nil:
+			accepted++
+		case errors.Is(err, ErrFull):
+			full = true
+		default:
+			t.Fatalf("write %d: %v", i, err)
+		}
+		time.Sleep(5 * time.Millisecond) // let the flusher read and skip
+	}
+
+	s := b.Stats()
+	if !full {
+		t.Fatalf("all %d writes were admitted against a capacity of 4; records that will not decode still occupy the log", accepted)
+	}
+	if accepted > 4 {
+		t.Fatalf("%d writes were admitted against a capacity of 4: a skipped record holds its capacity until the mark passes it", accepted)
+	}
+	if s.Dropped == 0 {
+		t.Fatal("nothing was dropped, so the undecodable records never reached the skip path this test is about")
+	}
+	if s.Checkpoint != 0 {
+		t.Fatalf("Checkpoint = %d while the first batch is still outstanding, so the test is not measuring what it means to", s.Checkpoint)
+	}
+}
+
+func TestDropOldestDoesNotWaitOutTheBackoff(t *testing.T) {
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithCapacity(20, 0),
+		WithOnFull(DropOldest()),
+		WithFlush(5, 0, 5*time.Millisecond),
+		// Far longer than this test: the capacity held by the batch in flight
+		// has to come back because the floor reached it, not because its retry
+		// timer happened to fire.
+		WithRetry(Backoff{Initial: time.Minute, Max: time.Minute, Jitter: 0}, 0),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for i := range 200 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d against a dead sink with DropOldest: %v; the floor must cut the backoff short", i, err)
+		}
+	}
+	if s := b.Stats(); s.Dropped == 0 {
+		t.Fatal("nothing was dropped; DropOldest never reclaimed capacity")
+	}
+}
+
 func TestDeadLetterAfterMaxAttempts(t *testing.T) {
 	sink := &recorder{}
 	sink.failAll.Store(true)
@@ -653,20 +787,149 @@ func TestConcurrentWritersAllArrive(t *testing.T) {
 	}
 }
 
+func TestCloseCancellationKeepsRecordsForReplay(t *testing.T) {
+	dir := t.TempDir()
+	var started atomic.Bool
+	// A sink that honours its context and never returns on its own: what ends
+	// the delivery is Close's deadline, which is the shutdown talking and not
+	// the sink's verdict on the batch.
+	stuck := SinkFunc[string](func(ctx context.Context, _ Batch[string]) error {
+		started.Store(true)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	b := openBuf(t, dir, stuck, fast(
+		// One attempt, so the cancelled flush lands straight on the branch that
+		// decides retries are exhausted.
+		WithRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 1),
+	)...)
+
+	ctx := context.Background()
+	want := []string{"e0", "e1", "e2"}
+	for _, v := range want {
+		if err := b.Write(ctx, v); err != nil {
+			t.Fatalf("Write %s: %v", v, err)
+		}
+	}
+	waitFor(t, 5*time.Second, started.Load)
+
+	cctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := b.Close(cctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close against a stuck sink = %v, want its deadline", err)
+	}
+	if s := b.Stats(); s.Dropped != 0 {
+		t.Fatalf("Stats.Dropped = %d after a shutdown deadline; cancelling a delivery is not the sink exhausting its retries", s.Dropped)
+	}
+
+	sink := &recorder{}
+	b2 := openBuf(t, dir, sink, fast()...)
+	defer closeBuf(t, b2)
+	waitFor(t, 5*time.Second, func() bool { return len(sink.seen()) == len(want) })
+	if got := sink.seen(); !slices.Equal(got, want) {
+		t.Fatalf("after reopening the sink saw %q, want %q: unacknowledged records must replay", got, want)
+	}
+}
+
+func TestBlockThenDropOldestGivesUpAfterGrace(t *testing.T) {
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithCapacity(5, 0),
+		WithOnFull(BlockThenDropOldest(100*time.Millisecond)),
+		// Retries never end and never succeed, so an acknowledgement never
+		// releases anything: the only thing that can free a blocked writer is
+		// the policy being asked again once the backlog has aged past the grace
+		// period, and then shedding the batch it finds in flight.
+		WithRetry(Backoff{Initial: 5 * time.Millisecond, Max: 10 * time.Millisecond, Jitter: 0}, 0),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	// Comfortably more than the grace period, so a failure here means the writer
+	// was never reconsidered rather than that it was reconsidered too late.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := range 50 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d: %v; the grace period passed, so the policy must shed instead of blocking on", i, err)
+		}
+	}
+	if s := b.Stats(); s.Dropped == 0 {
+		t.Fatal("nothing was dropped, so the writes cannot have gone through the shedding path they were supposed to")
+	}
+}
+
+func TestCapacityBoundsRetainedRecords(t *testing.T) {
+	// The first batch never completes, so the low-water mark cannot move and
+	// the log cannot be truncated. Later batches succeed, and the capacity they
+	// hold has to stay held: their records are still on disk behind the stuck
+	// one, and releasing them would let writes carry on without bound.
+	sink := SinkFunc[string](func(ctx context.Context, batch Batch[string]) error {
+		if batch.ID == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	})
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithCapacity(4, 0),
+		WithFlush(2, 0, 5*time.Millisecond),
+		WithMaxInFlight(2),
+		WithOnFull(Reject()),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	ctx := context.Background()
+	accepted, full := 0, false
+	for i := range 40 {
+		switch err := b.Write(ctx, fmt.Sprintf("e%d", i)); {
+		case err == nil:
+			accepted++
+		case errors.Is(err, ErrFull):
+			full = true
+		default:
+			t.Fatalf("write %d: %v", i, err)
+		}
+		// Let the flusher dispatch and the sink acknowledge, which is what would
+		// hand the capacity back too early.
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !full {
+		t.Fatalf("all %d writes were admitted against a capacity of 4; acknowledged records still in the log must keep holding it", accepted)
+	}
+	if accepted > 4 {
+		t.Fatalf("%d writes were admitted against a capacity of 4: capacity has to bound what the log retains, not just what the sink has not seen", accepted)
+	}
+	if s := b.Stats(); s.Checkpoint != 0 {
+		t.Fatalf("Checkpoint = %d while the first batch is still outstanding, so the test is not measuring what it means to", s.Checkpoint)
+	}
+}
+
 func TestAckTrackerLowWaterMark(t *testing.T) {
 	a := newAckTracker(0)
 
-	if got := a.ack(11, 20); got != 0 {
-		t.Fatalf("acking a later range moved the mark to %d; it must wait for the gap", got)
+	// Capacity is released as the mark passes a range, not as the range is
+	// acknowledged: until the mark moves, the records are still in the log.
+	if got, count, bytes := a.ack(11, 20, 10, 100); got != 0 || count != 0 || bytes != 0 {
+		t.Fatalf("acking a later range gave mark %d and freed %d/%d; it must wait for the gap", got, count, bytes)
 	}
-	if got := a.ack(21, 30); got != 0 {
-		t.Fatalf("mark = %d, want 0 while [1,10] is outstanding", got)
+	if got, count, bytes := a.ack(21, 30, 10, 100); got != 0 || count != 0 || bytes != 0 {
+		t.Fatalf("mark = %d freeing %d/%d, want 0 and nothing freed while [1,10] is outstanding", got, count, bytes)
 	}
-	if got := a.ack(1, 10); got != 30 {
-		t.Fatalf("closing the gap gave mark %d, want 30", got)
+	if got, count, bytes := a.ack(1, 10, 10, 100); got != 30 || count != 30 || bytes != 300 {
+		t.Fatalf("closing the gap gave mark %d freeing %d records/%d bytes, want 30 and 30/300", got, count, bytes)
 	}
-	if got := a.ack(31, 40); got != 40 {
-		t.Fatalf("mark = %d, want 40", got)
+	if got, count, bytes := a.ack(31, 40, 10, 100); got != 40 || count != 10 || bytes != 100 {
+		t.Fatalf("mark = %d freeing %d/%d, want 40 and 10/100", got, count, bytes)
 	}
 }
 

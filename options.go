@@ -99,9 +99,16 @@ func WithMaxRecordBytes(n int) Option {
 	return func(c *config) { c.wal.MaxRecordBytes = n }
 }
 
-// WithCapacity bounds the unflushed backlog. Exceeding either limit hands the
-// write to the configured Policy. Zero means unlimited, which makes the sink
-// the only thing standing between a burst and a full disk.
+// WithCapacity bounds the backlog the log still holds. Exceeding either limit
+// hands the write to the configured Policy. Zero means unlimited, which makes
+// the sink the only thing standing between a burst and a full disk.
+//
+// The backlog is measured against the low-water mark rather than against what
+// the sink has taken, because that is what the disk holds: records behind a
+// batch that has not finished keep their capacity until it lands and the log
+// can be truncated past them. That includes records nobody will deliver — ones
+// a policy dropped, or ones that would not decode — since those sit in the log
+// like any other until the mark passes them.
 func WithCapacity(maxRecords int64, maxBytes int64) Option {
 	return func(c *config) {
 		c.maxRecords = maxRecords

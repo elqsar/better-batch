@@ -38,30 +38,43 @@ func (g *gate) signal() {
 type ackTracker struct {
 	mu   sync.Mutex
 	low  uint64
-	done map[uint64]uint64 // firstLSN -> lastLSN, completed ahead of the mark
+	done map[uint64]acked // firstLSN -> range completed ahead of the mark
+}
+
+// acked is a completed range waiting for the mark to reach it, together with
+// the capacity it will give back when it does.
+type acked struct {
+	last  uint64
+	count int64
+	bytes int64
 }
 
 func newAckTracker(low uint64) *ackTracker {
-	return &ackTracker{low: low, done: make(map[uint64]uint64)}
+	return &ackTracker{low: low, done: make(map[uint64]acked)}
 }
 
-// ack records that every LSN in [first, last] is handled and returns the
-// resulting low-water mark.
-func (a *ackTracker) ack(first, last uint64) uint64 {
+// ack records that every LSN in [first, last] is handled, carrying the capacity
+// those records hold. It returns the resulting low-water mark and the capacity
+// the mark's advance has freed: nothing while the range waits behind an earlier
+// one, and the whole run at once when the earlier one finally lands.
+func (a *ackTracker) ack(first, last uint64, count, bytes int64) (mark uint64, freedCount, freedBytes int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if first != a.low+1 {
-		a.done[first] = last
-		return a.low
+		a.done[first] = acked{last: last, count: count, bytes: bytes}
+		return a.low, 0, 0
 	}
 	a.low = last
+	freedCount, freedBytes = count, bytes
 	for {
 		next, ok := a.done[a.low+1]
 		if !ok {
-			return a.low
+			return a.low, freedCount, freedBytes
 		}
 		delete(a.done, a.low+1)
-		a.low = next
+		a.low = next.last
+		freedCount += next.count
+		freedBytes += next.bytes
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -437,6 +438,91 @@ func TestRecordTooLarge(t *testing.T) {
 	}
 }
 
+// errReader yields its bytes and then fails, standing in for storage that goes
+// bad underneath a segment.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestMatchesChecksumPropagatesReadErrors(t *testing.T) {
+	body := []byte("a record recovery never gets to the end of")
+	crc := checksum(uint32(len(body)), body)
+	length := uint32(len(body))
+
+	failing := errors.New("input/output error")
+	if ok, err := matchesChecksum(&errReader{data: body[:8], err: failing}, length, crc); ok || !errors.Is(err, failing) {
+		t.Fatalf("matchesChecksum over a failing reader = (%v, %v), want (false, the read error): storage failing is not a torn tail", ok, err)
+	}
+
+	// A payload that merely ends early is an answer, not a failure: there is no
+	// whole record there.
+	if ok, err := matchesChecksum(&errReader{data: body[:8], err: io.EOF}, length, crc); ok || err != nil {
+		t.Fatalf("matchesChecksum over a short payload = (%v, %v), want (false, nil)", ok, err)
+	}
+	if ok, err := matchesChecksum(&errReader{data: body, err: io.EOF}, length, crc); !ok || err != nil {
+		t.Fatalf("matchesChecksum over the whole record = (%v, %v), want (true, nil)", ok, err)
+	}
+}
+
+func TestLoweredMaxRecordBytesIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	l := open(t, dir, Options{MaxRecordBytes: 128})
+	ctx := context.Background()
+	for i := range 2 {
+		if _, err := l.Append(ctx, bytes.Repeat([]byte("x"), 64)); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	before := segmentBytes(t, dir)
+
+	if _, err := Open(dir, Options{MaxRecordBytes: 32}); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("Open below the size of the stored records = %v, want ErrRecordTooLarge; a config change must not decide what is a torn tail", err)
+	}
+	if after := segmentBytes(t, dir); after != before {
+		t.Fatalf("the rejected Open left %d segment bytes, want the original %d: it must not touch the data it refuses to read", after, before)
+	}
+
+	l2 := open(t, dir, Options{MaxRecordBytes: 128})
+	_, payloads := readAll(t, l2, 0)
+	if len(payloads) != 2 {
+		t.Fatalf("reopening at the original limit found %d records, want 2", len(payloads))
+	}
+}
+
+// segmentBytes is the total size of the segment files in a log directory.
+func segmentBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var total int64
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != segmentSuffix {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("stat %s: %v", e.Name(), err)
+		}
+		total += info.Size()
+	}
+	return total
+}
+
 func TestAppendRespectsContextCancellation(t *testing.T) {
 	// A long sync interval means the append is still waiting when ctx expires.
 	l := open(t, t.TempDir(), Options{SyncInterval: time.Hour})
@@ -681,6 +767,67 @@ func TestRepeatedCommitFailuresStayConsistent(t *testing.T) {
 		if lsns[i] != uint64(i+1) || !bytes.Equal(payloads[i], payload(i)) {
 			t.Fatalf("record %d is LSN %d %q, want LSN %d %q", i, lsns[i], payloads[i], i+1, payload(i))
 		}
+	}
+}
+
+func TestRolledBackCommitIsNotReportedDurable(t *testing.T) {
+	dir := t.TempDir()
+	var failing atomic.Bool
+	opts := Options{SyncMode: SyncAlways}
+	opts.WriteFunc = func(f *os.File, b []byte) (int, error) {
+		if failing.Load() {
+			return 0, syscall.ENOSPC
+		}
+		return f.Write(b)
+	}
+	l := open(t, dir, opts)
+	ctx := context.Background()
+
+	// One healthy append claims the block of LSNs, so nothing below writes the
+	// reservation again while the disk is "full".
+	if _, err := l.Append(ctx, []byte("first")); err != nil {
+		t.Fatalf("Append before the disk filled: %v", err)
+	}
+
+	failing.Store(true)
+	lost, err := l.AppendBatchAsync([][]byte{[]byte("lost")})
+	if err != nil {
+		t.Fatalf("staging the doomed record: %v", err)
+	}
+	// Let the round fail and hand its LSNs back before anything else is staged,
+	// so the replacement lands in a round of its own.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l.mu.Lock()
+		rolledBack := l.nextLSN == lost.First && len(l.pending) == 0
+		l.mu.Unlock()
+		if rolledBack {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the failed commit round never rolled back")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	failing.Store(false)
+	lsn, err := l.Append(ctx, []byte("replacement"))
+	if err != nil {
+		t.Fatalf("Append after space came back: %v", err)
+	}
+	if lsn != lost.First {
+		t.Fatalf("replacement got LSN %d, want the discarded %d: without the reuse this test proves nothing", lsn, lost.First)
+	}
+
+	// The waiter arrives only now, with its LSN already durable — but durable as
+	// somebody else's record.
+	if err := l.Await(ctx, lost); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Await on a rolled-back commit = %v, want ENOSPC: LSN %d names the replacement now", err, lost.First)
+	}
+
+	_, payloads := readAll(t, l, 0)
+	if len(payloads) != 2 || !bytes.Equal(payloads[1], []byte("replacement")) {
+		t.Fatalf("log holds %q, want the first record and the replacement", payloads)
 	}
 }
 

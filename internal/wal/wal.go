@@ -72,7 +72,9 @@ type Options struct {
 	MaxSegmentBytes int64
 
 	// MaxRecordBytes is the largest payload the log accepts. It also bounds how
-	// much a corrupt length field can make recovery allocate. Default 4 MiB.
+	// much a corrupt length field can make recovery read. Lowering it below the
+	// size of a record already on disk fails Open with ErrRecordTooLarge rather
+	// than mistaking that record for a torn tail. Default 4 MiB.
 	MaxRecordBytes int
 
 	// CommitBytes forces an early commit round once this many bytes are
@@ -126,13 +128,16 @@ type Log struct {
 	pendingMin uint64
 	pendingMax uint64
 
-	durable    uint64        // highest LSN that has completed a commit round
-	commitWait chan struct{} // closed at the end of every commit round
-	closed     bool
+	durable uint64 // highest LSN that has completed a commit round
+	closed  bool
 
-	// epoch increments whenever a failed commit is rolled back. A waiter whose
-	// epoch no longer matches had its record discarded and must be told so.
-	epoch   uint64
+	// cur is the round the staged records will be committed in; inflight is the
+	// one the committer is writing right now. Records learn their fate from the
+	// round they were staged into, never from their LSN: a rollback hands its
+	// LSNs back, so the next round gives the same numbers to different records.
+	cur      *round
+	inflight *round
+
 	failErr error
 	// broken is set only when a rollback itself failed, so the segment may hold
 	// garbage that later appends would bury. That case really is terminal.
@@ -161,12 +166,12 @@ func Open(dir string, opts Options) (*Log, error) {
 	}
 
 	l := &Log{
-		dir:        dir,
-		opts:       opts,
-		lock:       lock,
-		commitWait: make(chan struct{}),
-		signal:     make(chan struct{}, 1),
-		done:       make(chan struct{}),
+		dir:    dir,
+		opts:   opts,
+		lock:   lock,
+		cur:    newRound(),
+		signal: make(chan struct{}, 1),
+		done:   make(chan struct{}),
 	}
 	if err := l.recover(); err != nil {
 		lock.Close()
@@ -284,14 +289,32 @@ func (l *Log) Append(ctx context.Context, payload []byte) (uint64, error) {
 	if len(payload) > l.opts.MaxRecordBytes {
 		return 0, ErrRecordTooLarge
 	}
-	lsn, epoch, force, err := l.stage(func(dst []byte) []byte { return appendRecord(dst, payload) }, 1)
+	lsn, r, force, err := l.stage(func(dst []byte) []byte { return appendRecord(dst, payload) }, 1)
 	if err != nil {
 		return 0, err
 	}
 	if force {
 		l.signalCommit()
 	}
-	return lsn, l.waitDurable(ctx, lsn, epoch)
+	return lsn, l.wait(ctx, r)
+}
+
+// round is the outcome of one commit round: nil once its records are durable,
+// the commit error once they have been rolled back. It is what a waiter holds
+// on to, because an LSN cannot answer the question — a rollback hands its LSNs
+// back and the next round gives the same numbers to different records.
+type round struct {
+	done chan struct{}
+	err  error // written before done is closed, read only after
+}
+
+func newRound() *round { return &round{done: make(chan struct{})} }
+
+// resolve settles a round. It runs on the committer goroutine only; closing the
+// channel publishes err to every waiter.
+func (r *round) resolve(err error) {
+	r.err = err
+	close(r.done)
 }
 
 // Commit identifies a group of staged records so that waiting for their fate is
@@ -301,10 +324,10 @@ func (l *Log) Append(ctx context.Context, payload []byte) (uint64, error) {
 type Commit struct {
 	First, Last uint64
 
-	// epoch pins the commit generation the records were staged in. An LSN alone
-	// is not enough: a rollback hands the LSNs back, so a later record can take
-	// the same number and look durable to a stale waiter.
-	epoch uint64
+	// r is the commit round the records were staged into. An LSN alone is not
+	// enough: a rollback hands the LSNs back, so a later record can take the
+	// same number and look durable to a stale waiter.
+	r *round
 }
 
 // AppendBatch stages several records under a single lock acquisition and a
@@ -333,7 +356,7 @@ func (l *Log) AppendBatchAsync(payloads [][]byte) (Commit, error) {
 			return Commit{}, ErrRecordTooLarge
 		}
 	}
-	first, epoch, force, err := l.stage(func(dst []byte) []byte {
+	first, r, force, err := l.stage(func(dst []byte) []byte {
 		for _, p := range payloads {
 			dst = appendRecord(dst, p)
 		}
@@ -345,7 +368,7 @@ func (l *Log) AppendBatchAsync(payloads [][]byte) (Commit, error) {
 	if force {
 		l.signalCommit()
 	}
-	return Commit{First: first, Last: first + uint64(len(payloads)) - 1, epoch: epoch}, nil
+	return Commit{First: first, Last: first + uint64(len(payloads)) - 1, r: r}, nil
 }
 
 // Await returns nil once the records in c are durable, the commit error if they
@@ -353,18 +376,18 @@ func (l *Log) AppendBatchAsync(payloads [][]byte) (Commit, error) {
 // their fate was still undecided. In that last case the records remain staged
 // and may yet be committed, so the caller must not treat them as lost.
 func (l *Log) Await(ctx context.Context, c Commit) error {
-	return l.waitDurable(ctx, c.Last, c.epoch)
+	return l.wait(ctx, c.r)
 }
 
 // stage encodes records into the pending buffer and assigns their LSNs.
-func (l *Log) stage(encode func([]byte) []byte, n uint64) (first, epoch uint64, force bool, err error) {
+func (l *Log) stage(encode func([]byte) []byte, n uint64) (first uint64, r *round, force bool, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return 0, 0, false, ErrClosed
+		return 0, nil, false, ErrClosed
 	}
 	if l.broken {
-		return 0, 0, false, l.failErr
+		return 0, nil, false, l.failErr
 	}
 	// LSNs are claimed durably before they are handed out, in blocks so the
 	// fsync costs one round per reserveBlock records. Without this a crash that
@@ -373,11 +396,11 @@ func (l *Log) stage(encode func([]byte) []byte, n uint64) (first, epoch uint64, 
 	if last := l.nextLSN + n - 1; last > l.reserved {
 		want := max(last, l.nextLSN+reserveBlock-1)
 		if err := l.writeReserved(want); err != nil {
-			return 0, 0, false, fmt.Errorf("wal: reserve LSNs: %w", err)
+			return 0, nil, false, fmt.Errorf("wal: reserve LSNs: %w", err)
 		}
 		l.reserved = want
 	}
-	epoch = l.epoch
+	r = l.cur
 	first = l.nextLSN
 	if len(l.pending) == 0 {
 		l.pendingMin = first
@@ -389,34 +412,24 @@ func (l *Log) stage(encode func([]byte) []byte, n uint64) (first, epoch uint64, 
 	// fewer fsyncs. SyncAlways and SyncNever have nothing to amortise, so they
 	// commit as soon as there is something to commit.
 	force = l.opts.SyncMode != SyncPeriodic || len(l.pending) >= l.opts.CommitBytes
-	return first, epoch, force, nil
+	return first, r, force, nil
 }
 
-func (l *Log) waitDurable(ctx context.Context, lsn, epoch uint64) error {
-	for {
-		l.mu.Lock()
-		// Durability is checked first: a record that made it to disk stays
-		// successful even if a later commit round failed and rolled back.
-		if l.durable >= lsn {
-			l.mu.Unlock()
-			return nil
-		}
-		if l.epoch != epoch {
-			err := l.failErr
-			l.mu.Unlock()
-			return err
-		}
-		ch := l.commitWait
-		l.mu.Unlock()
-
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			// The records stay staged, so this is "undecided", not "failed".
-			// ErrPending says so; the ctx error is kept for callers matching on
-			// cancellation.
-			return fmt.Errorf("%w: %w", ErrPending, ctx.Err())
-		}
+// wait blocks until r has been decided and reports what it decided. Asking the
+// round rather than comparing LSNs is what keeps a rolled-back record from
+// looking durable once its number has been handed to its replacement.
+func (l *Log) wait(ctx context.Context, r *round) error {
+	if r == nil {
+		return nil // nothing was staged
+	}
+	select {
+	case <-r.done:
+		return r.err
+	case <-ctx.Done():
+		// The records stay staged, so this is "undecided", not "failed".
+		// ErrPending says so; the ctx error is kept for callers matching on
+		// cancellation.
+		return fmt.Errorf("%w: %w", ErrPending, ctx.Err())
 	}
 }
 
@@ -437,10 +450,15 @@ func (l *Log) signalCommit() {
 // durable.
 func (l *Log) Sync(ctx context.Context) error {
 	l.mu.Lock()
-	target, epoch := l.pendingMax, l.epoch
+	// Rounds are decided in order, so the round the staged records are going
+	// into covers the one already in flight as well.
+	r := l.inflight
+	if len(l.pending) > 0 {
+		r = l.cur
+	}
 	l.mu.Unlock()
 	l.signalCommit()
-	return l.waitDurable(ctx, target, epoch)
+	return l.wait(ctx, r)
 }
 
 func (l *Log) committer() {
@@ -496,6 +514,8 @@ func (l *Log) commit() error {
 	}
 	buf := l.pending
 	first, last := l.pendingMin, l.pendingMax
+	r := l.cur
+	l.cur, l.inflight = newRound(), r
 	l.pending, l.spare = l.spare[:0], nil
 	l.pendingMin, l.pendingMax = 0, 0
 	l.mu.Unlock()
@@ -511,12 +531,13 @@ func (l *Log) commit() error {
 	}
 
 	l.mu.Lock()
+	var staged *round
 	if err != nil {
-		l.epoch++
 		l.failErr = err
 		// Anything staged while this round was in flight was numbered above the
 		// records that just vanished, so it has to go too; its appenders learn
-		// about it through the epoch change.
+		// about it from the round they staged into.
+		staged, l.cur = l.cur, newRound()
 		l.pending = l.pending[:0]
 		l.pendingMin, l.pendingMax = 0, 0
 		l.nextLSN = first
@@ -526,18 +547,21 @@ func (l *Log) commit() error {
 			l.broken = true
 			l.failErr = errors.Join(err, rollbackErr)
 		}
+		err = l.failErr
 	} else {
 		l.durable = last
 	}
+	l.inflight = nil
 	l.spare = buf[:0]
-	close(l.commitWait)
-	l.commitWait = make(chan struct{})
-	out := l.failErr
-	if err == nil {
-		out = nil
-	}
 	l.mu.Unlock()
-	return out
+
+	// Resolving outside the lock is safe: a waiter reads the outcome from the
+	// round, not from the log.
+	r.resolve(err)
+	if staged != nil {
+		staged.resolve(err)
+	}
+	return err
 }
 
 // rollback cuts the active segment back to the last byte that was durable.

@@ -199,8 +199,10 @@ retention keeps small.
    handling to be rewritten. A failed commit used to poison the log for good, on the
    reasoning that a partial write leaves a fragment later appends would bury. It is
    recoverable instead: the segment is cut back to its last durable byte, the discarded
-   records' LSNs are handed out again, and their appenders learn about it through an epoch
-   counter. Only a rollback that *itself* fails is terminal. `OnFull` then fires through the
+   records' LSNs are handed out again, and their appenders learn about it from a handle to
+   the commit round they staged into. The handle, rather than the LSN, is what carries the
+   outcome — the numbers come back, so the next round gives them to different records.
+   Only a rollback that *itself* fails is terminal. `OnFull` then fires through the
    same path as the memory cap, with `State.DiskFull` set.
 
    The way back out is narrow and worth stating: only truncating a segment frees space, only
@@ -289,10 +291,56 @@ Two bugs the tests caught, both worth keeping in mind for the layers still to co
   dispatched to a failing sink, a writer blocked forever under a policy whose entire job is
   to never block. A batch in flight can only be abandoned whole, so that is what it does
   now — coarser than dropping single records, and the reason it is documented as
-  approximate.
+  approximate. Raising the floor also cuts that batch's retry backoff short, since the
+  abandon is what hands its capacity back and the backoff can have grown to half a minute.
 - **`Close` closed the log while the flusher was still reading it.** Only reachable when
   `Close`'s context expired first, which is exactly when a shutdown is already going badly.
   `Close` now waits for the flusher to actually stop before touching the log, always.
+
+Five more came out of a review pass before the first release. What they have in common is
+that each one is a case where two things that look alike are not:
+
+- **A rolled-back record could be reported as durable.** A waiter compared its LSN against
+  the durable mark before checking whether its round had failed, and a rollback hands the
+  LSNs straight back to the next round. Once a replacement took the number, the number said
+  "durable" and the original writer was told its lost record was safe. Outcomes now belong
+  to the round, not to the number.
+- **Lowering `MaxRecordBytes` deleted records.** Recovery read any over-long length field as
+  a corrupt one and truncated the tail, so a smaller limit on the next `Open` silently
+  removed everything from the first record that no longer fit. The checksum tells a real
+  record from a corrupt length, so recovery reads it and refuses to open instead.
+- **A cancelled shutdown counted as retries running out.** `Close`'s deadline cancels the
+  delivery context; the sink returned that error like any other, and a batch on its last
+  attempt was dead-lettered or dropped and then checkpointed away. Cancellation from the
+  shutdown now leaves the range unacknowledged, which is what makes "nothing is lost when
+  `Close` times out" true.
+- **`BlockThenDropOldest` could block for ever.** The policy is only consulted when the
+  admission loop wakes, and the loop only woke when capacity was released — which a dead
+  sink never does. A policy that gives up after a grace period needs a clock of its own, so
+  the loop now waits on a short, doubling timer as well.
+- **Capacity did not bound what the log kept.** Capacity was released when a batch was
+  acknowledged, but a batch acknowledged ahead of an unfinished earlier one cannot move the
+  low-water mark, and nothing below the mark can be truncated. With `MaxInFlight` above 1,
+  one stuck batch let writes carry on for ever while the log grew. Capacity is now released
+  as the mark advances, which is the moment the space can actually come back.
+
+A follow-up review found three more, two of them in that round's own work. The theme is the
+same — two things that look alike and are not:
+
+- **A cancelled dead-letter call still counted as a verdict.** The shutdown check went into
+  the primary flush path but not into the dead-letter one, so a `Close` deadline that
+  cancelled the dead-letter sink dropped the batch and checkpointed past it. Both calls ask
+  the same question before disposing of anything now.
+- **Dropped records were exempted from that same accounting.** Skipped records — policy
+  drops, undecodable ones — released their capacity the moment the flusher read past them,
+  on the reasoning that the mark would follow immediately. It does not when something
+  earlier is stuck, which is precisely the case the accounting exists for, so the flusher
+  carries their counts into the range that acknowledges them. Exempting the easy case from
+  an invariant is how the invariant stops being one.
+- **The oversized-record check could not tell a read failure from a bad checksum.** The
+  helper that streams a too-long payload through the CRC turned every error into "not a
+  record", and recovery reads that as a torn tail — so an EIO would have truncated the
+  segment. It returns the error separately now, the way the neighbouring read already did.
 
 ### Where the time actually goes
 

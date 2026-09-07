@@ -514,14 +514,14 @@ checkpoint succeeds and the buffer keeps working meanwhile, while `Err` is termi
 | --- | --- | --- |
 | `WithSync(mode, interval)` | `SyncPeriodic`, 5ms | durability vs. fsync cost |
 | `WithFlush(records, bytes, interval)` | 1000, 4 MiB, 1s | batch-out triggers |
-| `WithCapacity(records, bytes)` | 1e6, 1 GiB | unflushed backlog cap; 0 means unlimited |
+| `WithCapacity(records, bytes)` | 1e6, 1 GiB | cap on records the log still retains; 0 means unlimited |
 | `WithOnFull(policy)` | `Block()` | what happens at capacity or on a full disk |
 | `WithMaxInFlight(n)` | 1 | above 1 breaks ordering and the sink must be concurrent-safe |
 | `WithRetry(backoff, maxAttempts)` | 100ms→30s, forever | 0 attempts means retry forever |
 | `WithDeadLetter[T](sink)` | none | where exhausted batches go |
 | `WithCheckpointInterval(d)` | 200ms | longer means fewer fsyncs, more replay after a crash |
 | `WithSegmentBytes(n)` | 64 MiB | soft cap; segments may overshoot by one commit batch |
-| `WithMaxRecordBytes(n)` | 4 MiB | largest single encoded record |
+| `WithMaxRecordBytes(n)` | 4 MiB | largest single encoded record; lowering it below stored records fails `Open` |
 | `WithObserver(o)` | none | metrics hooks |
 
 ## Codecs
@@ -555,9 +555,12 @@ wedging the pipeline behind it.
   reaches the end of the log is a torn tail — expected after a crash — and is truncated.
   A bad record with intact records after it is interior corruption and fails `Open`,
   because truncating there would silently discard durable records and the implicit LSN
-  numbering cannot be reconstructed across a hole. The one blind spot is a corrupted
-  length field in the final record's header: the next record boundary is unrecoverable,
-  so it is indistinguishable from a torn header and is truncated.
+  numbering cannot be reconstructed across a hole. A length field above the configured
+  `WithMaxRecordBytes` is checksummed before anything is decided: if it verifies, the
+  record is real and was written under a larger limit, and `Open` fails rather than
+  deleting it. The one blind spot is a length field that is corrupt *and* fails its
+  checksum in the final record's header: the next record boundary is unrecoverable, so it
+  is indistinguishable from a torn header and is truncated.
 - **Crash replay** starts from the last checkpoint, so `WithCheckpointInterval` sets how
   much gets re-delivered. Duplicates are the contract, not a bug. The checkpoint is fsynced
   while `SyncNever` records are not, so it can survive a machine crash that the log tail did
@@ -565,9 +568,15 @@ wedging the pipeline behind it.
   below the mark was already acked by the sink.
 - **`Close(ctx)`** drains, checkpoints, and releases the directory. If `ctx` expires it stops
   waiting and returns the error; nothing is lost, since unacknowledged records replay on the
-  next `Open`. A sink that ignores its context can still stall shutdown.
+  next `Open`. A delivery that fails because the shutdown cancelled it is not counted as a
+  retry that ran out, so it is neither dead-lettered nor dropped. A sink that ignores its
+  context can still stall shutdown.
 - **Sizing:** `WithCapacity` bounds the backlog on disk, so it is the number that decides how
-  long an outage you can ride out. At 1 KiB per event, 1 GiB is roughly a million events.
+  long an outage you can ride out. At 1 KiB per event, 1 GiB is roughly a million events. It
+  counts every record the log still holds, whatever became of it: with `WithMaxInFlight`
+  above 1 a batch that never completes pins the low-water mark, and everything behind it —
+  records the sink has already taken, records dropped by policy, records that would not
+  decode — stays on disk and keeps holding its capacity until that batch lands.
 
 ## Design notes
 
