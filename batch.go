@@ -25,6 +25,12 @@ var (
 	// are truncated.
 	ErrDiskFull = errors.New("batch: no space left on device")
 
+	// ErrFailed means the buffer has hit an unrecoverable error and accepts no
+	// more writes. Records already written stay durable and replay on the next
+	// Open. The cause is wrapped alongside it, and is also reported by
+	// Stats().Err.
+	ErrFailed = errors.New("batch: buffer has failed")
+
 	// ErrUncertain means the write's context expired while its records were
 	// waiting for their commit round. They were staged, so they may still be
 	// committed and delivered to the sink; the buffer finishes accounting for
@@ -355,14 +361,29 @@ const (
 	blockRetryInterval = 100 * time.Millisecond
 )
 
-// enter registers a writer, unless the buffer has been sealed by Close.
+// enter registers a writer, unless the buffer has been sealed by Close or has
+// failed. A failed buffer never drains, so a write it accepted would sit in the
+// log behind a flusher that has stopped, and under the default Block policy the
+// writer after it would park for good with nothing to say why.
 func (b *Buffer[T]) enter() error {
+	if err := b.failure(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.sealed {
 		return ErrClosed
 	}
 	b.writers.Add(1)
+	return nil
+}
+
+// failure reports the buffer's fatal error as something a caller can test for,
+// keeping the cause attached to it.
+func (b *Buffer[T]) failure() error {
+	if err := b.err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrFailed, err)
+	}
 	return nil
 }
 
@@ -427,6 +448,12 @@ func (b *Buffer[T]) admit(ctx context.Context, n, size int64) (bool, error) {
 			return true, nil
 		}
 		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		// A writer already parked here has to learn about a buffer that failed
+		// while it waited: the space it wants is never coming, because the
+		// flusher that would release it has stopped.
+		if err := b.failure(); err != nil {
 			return false, err
 		}
 

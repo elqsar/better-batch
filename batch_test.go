@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1260,5 +1261,300 @@ func TestFlushReturnsAfterAnUnusedRecoveryReopen(t *testing.T) {
 	defer cancel()
 	if err := b.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v; it is waiting for records the recovery segment never held", err)
+	}
+}
+
+// dlqRecorder counts every attempt the dead-letter sink is given, which is what
+// separates "retried and eventually landed" from "took it first time".
+type dlqRecorder struct {
+	recorder
+	attempts atomic.Int64
+
+	amu   sync.Mutex
+	perID map[uint64]int
+}
+
+func (d *dlqRecorder) Flush(ctx context.Context, b Batch[string]) error {
+	d.attempts.Add(1)
+	d.amu.Lock()
+	if d.perID == nil {
+		d.perID = map[uint64]int{}
+	}
+	d.perID[b.ID]++
+	d.amu.Unlock()
+	return d.recorder.Flush(ctx, b)
+}
+
+// attemptsPerBatch reports how many times each batch was offered. The flusher
+// is free to cut batches wherever it likes, so a total attempt count says
+// nothing on its own; the per-batch count is the configured limit.
+func (d *dlqRecorder) attemptsPerBatch() map[uint64]int {
+	d.amu.Lock()
+	defer d.amu.Unlock()
+	return maps.Clone(d.perID)
+}
+
+func TestDeadLetterRetriesBeforeDropping(t *testing.T) {
+	// A dead-letter sink that blips must not cost the records. Before the
+	// dead-letter sink was retried, the first error discarded the whole batch.
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	dlq := &dlqRecorder{}
+	dlq.failures.Store(2) // two blips, then it accepts
+
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 1),
+		WithDeadLetter[string](dlq),
+		WithDeadLetterRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 5),
+	)...)
+	ctx := context.Background()
+	want := []string{"e0", "e1", "e2"}
+	for _, v := range want {
+		if err := b.Write(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	closeBuf(t, b)
+
+	if got := dlq.seen(); !slices.Equal(got, want) {
+		t.Fatalf("dead-letter sink saw %q, want %q: a transient dead-letter failure must not lose the batch", got, want)
+	}
+	if got := dlq.attempts.Load(); got != 3 {
+		t.Fatalf("dead-letter sink was called %d times, want 3 (two failures then success)", got)
+	}
+	if s := b.Stats(); s.DeadLettered != 3 || s.Dropped != 0 {
+		t.Fatalf("Stats reports %d dead-lettered and %d dropped, want 3 and 0", s.DeadLettered, s.Dropped)
+	}
+}
+
+func TestDeadLetterExhaustsAttemptsAndDrops(t *testing.T) {
+	// Bounded is the other half of the contract: a dead-letter sink that is
+	// also down must not wedge the pipeline behind it.
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	dlq := &dlqRecorder{}
+	dlq.failAll.Store(true)
+
+	c := newCounters()
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 1),
+		WithDeadLetter[string](dlq),
+		WithDeadLetterRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 2),
+		WithObserver(c.observer()),
+	)...)
+	ctx := context.Background()
+	for i := range 4 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: an exhausted dead-letter sink must still advance the checkpoint: %v", err)
+	}
+	closeBuf(t, b)
+
+	for id, n := range dlq.attemptsPerBatch() {
+		if n != 2 {
+			t.Fatalf("dead-letter sink was offered batch %d %d times, want exactly the 2 attempts configured", id, n)
+		}
+	}
+	if s := b.Stats(); s.Dropped != 4 || s.DeadLettered != 0 {
+		t.Fatalf("Stats reports %d dropped and %d dead-lettered, want 4 and 0", s.Dropped, s.DeadLettered)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.drops[ReasonRetriesExhausted] != 4 {
+		t.Fatalf("ReasonRetriesExhausted drops = %d, want 4", c.drops[ReasonRetriesExhausted])
+	}
+	dlqFlushes := 0
+	for _, f := range c.flushes {
+		if f.DeadLetter {
+			dlqFlushes++
+		}
+	}
+	if want := int(dlq.attempts.Load()); dlqFlushes != want {
+		t.Fatalf("OnFlush reported %d dead-letter attempts, want %d: a dead-letter sink stuck retrying must be visible", dlqFlushes, want)
+	}
+}
+
+func TestDeadLetterRetryAbandonedByDropOldest(t *testing.T) {
+	// A batch waiting out its dead-letter backoff holds capacity, and only
+	// abandoning it whole gives that capacity back. Without the floor check in
+	// the dead-letter loop, DropOldest — the one policy that exists never to
+	// block — would block here.
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	dlq := &dlqRecorder{}
+	dlq.failAll.Store(true)
+
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithCapacity(2, 0),
+		WithOnFull(DropOldest()),
+		WithRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 1),
+		WithDeadLetter[string](dlq),
+		// Long enough that the write below can only get through by abandoning
+		// the batch, not by outwaiting the backoff.
+		WithDeadLetterRetry(Backoff{Initial: time.Hour, Jitter: 0}, 0),
+	)...)
+	// A batch parked in an hour-long backoff cannot drain, so Close gives up
+	// waiting rather than returning cleanly. That is the point of the setup.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		b.Close(ctx)
+	}()
+
+	ctx := context.Background()
+	for i := range 2 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, 5*time.Second, func() bool { return dlq.attempts.Load() > 0 })
+
+	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Write(wctx, "e2"); err != nil {
+		t.Fatalf("Write under DropOldest: %v; capacity held by a batch parked in dead-letter backoff must be reclaimable", err)
+	}
+}
+
+func TestDecodeFailureHandlerSeesPayload(t *testing.T) {
+	// Quarantine is the caller's to implement; the buffer's job is to hand over
+	// the LSN and the stored bytes.
+	dir := t.TempDir()
+	sink := &recorder{}
+
+	type seen struct {
+		lsn     uint64
+		payload string
+	}
+	var mu sync.Mutex
+	var got []seen
+
+	b, err := Open[string](dir, sink, poisonCodec{}, fast(
+		WithOnDecodeFailure(func(f DecodeFailure) DecodeAction {
+			mu.Lock()
+			defer mu.Unlock()
+			// Payload aliases the read buffer, so it is copied here exactly as
+			// the doc comment tells a caller to.
+			got = append(got, seen{lsn: f.LSN, payload: string(f.Payload)})
+			return DropRecord
+		}),
+	)...)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	ctx := context.Background()
+	for _, v := range []string{"a", "poison", "b"} {
+		if err := b.Write(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	closeBuf(t, b)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("handler ran %d times, want 1", len(got))
+	}
+	if got[0].payload != "poison" {
+		t.Fatalf("handler saw payload %q, want %q", got[0].payload, "poison")
+	}
+	if got[0].lsn == 0 {
+		t.Fatal("handler saw LSN 0, want the record's own sequence number")
+	}
+	if s := b.Stats(); s.Dropped != 1 {
+		t.Fatalf("Stats.Dropped = %d, want 1: DropRecord must keep the behaviour it replaced", s.Dropped)
+	}
+	if want := []string{"a", "b"}; !slices.Equal(sink.seen(), want) {
+		t.Fatalf("sink saw %q, want %q: DropRecord must not disturb the records around it", sink.seen(), want)
+	}
+}
+
+func TestDecodeFailureStopsAndReplays(t *testing.T) {
+	// The scenario the option exists for: a codec that changed between runs
+	// meets a backlog the previous build wrote. Stopping must keep every record
+	// from the poisoned one on, so a restart with a codec that understands them
+	// still delivers them. Nothing may go missing across the three opens.
+	dir := t.TempDir()
+	want := []string{"a", "b", "poison", "c", "d"}
+	ctx := context.Background()
+
+	// Round one: a codec that has no trouble with them writes them down, and a
+	// sink that is down from the outset leaves the whole lot in the backlog.
+	first := &recorder{}
+	first.failAll.Store(true)
+	// Retries stay unbounded (the default) so the batch is never given up on
+	// and dropped: the point is to leave it in the log for the next open.
+	b := openBuf(t, dir, first, fast()...)
+	for _, v := range want {
+		if err := b.Write(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	if err := b.Close(cctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close against a failing sink = %v, want its deadline", err)
+	}
+
+	// Round two: the new build's codec cannot read what the old one wrote. The
+	// records ahead of the poisoned one still go, then delivery stops.
+	var quarantined atomic.Value
+	second := &recorder{}
+	b2, err := Open[string](dir, second, poisonCodec{}, fast(
+		WithOnDecodeFailure(func(f DecodeFailure) DecodeAction {
+			quarantined.Store(string(f.Payload))
+			return StopBuffer
+		}),
+	)...)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return b2.Stats().Err != nil })
+	if got, _ := quarantined.Load().(string); got != "poison" {
+		t.Fatalf("handler was given %q, want %q", got, "poison")
+	}
+	if werr := b2.Write(ctx, "late"); !errors.Is(werr, ErrFailed) {
+		t.Fatalf("Write on a stopped buffer = %v, want ErrFailed: a buffer that will never drain must say so", werr)
+	}
+	// Close reports the failure rather than pretending the buffer drained.
+	cctx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel2()
+	if err := b2.Close(cctx2); err == nil {
+		t.Fatal("Close on a stopped buffer returned nil, want the decode failure that stopped it")
+	}
+
+	// Round three: the codec understands them again. Everything the stopped
+	// buffer held back must arrive, poisoned record first.
+	third := &recorder{}
+	b3 := openBuf(t, dir, third, fast()...)
+	defer closeBuf(t, b3)
+	rest := want[len(second.seen()):]
+	waitFor(t, 5*time.Second, func() bool { return len(third.seen()) == len(rest) })
+
+	if got := third.seen(); !slices.Equal(got, rest) {
+		t.Fatalf("after the codec was fixed the sink saw %q, want %q: StopBuffer must keep every record from the poisoned one on", got, rest)
+	}
+	if !slices.Contains(third.seen(), "poison") {
+		t.Fatal("the record that stopped the buffer was not redelivered; StopBuffer exists to keep it")
+	}
+	if got := slices.Concat(second.seen(), third.seen()); !slices.Equal(got, want) {
+		t.Fatalf("across the three opens the sinks saw %q, want %q: no record may be lost to a codec change", got, want)
 	}
 }

@@ -91,6 +91,44 @@ by priority or age.
 Both capacity limits feed the same path: memory/record caps *and* disk full. Disk full is
 the one everyone forgets, and it is the most important one to get right.
 
+### 7. Undeliverable records are the caller's decision, not the library's
+
+Two places quietly threw records away, and both were reached exactly when the caller most
+wanted durability.
+
+**The dead-letter sink got one attempt.** The primary sink retries forever by default; the
+sink of last resort had a single shot, and any error — a network blip — discarded the whole
+batch as `ReasonRetriesExhausted`. That asymmetry is not defensible: a caller who configured
+`WithDeadLetter` said "do not lose these". It now retries on the same ladder, but **bounded
+by default** (three attempts), because the reason the original code gave up immediately is
+still true — a dead-letter sink that is also down must not wedge the pipeline behind it.
+`WithDeadLetterRetry` moves the bound, and 0 means forever.
+
+**A record that would not decode was dropped.** Payloads are bytes the buffer itself wrote
+and every record is checksummed, so a decode failure is not corruption — it is the codec
+having changed between runs, a rollout replaying a backlog the previous build produced.
+Dropping keeps the pipeline moving, which is the right default; but for a buffer whose whole
+purpose is not losing records, "your deploy silently ate the backlog" is the wrong only
+option. `WithOnDecodeFailure` hands over the LSN and the raw bytes, and takes back one of
+two answers: `DropRecord`, or `StopBuffer`.
+
+`StopBuffer` works by *not* acknowledging: the poisoned LSN never reaches `complete`, so the
+low-water mark stays below it, `persist` cannot truncate it away, and the next `Open` reads
+it again. Records already read ahead of it are dispatched first, so stopping costs no
+duplicates it does not have to.
+
+**Quarantine is a callback, not a directory.** Writing bad payloads to `dir/quarantine/`
+would have meant a second on-disk format with its own rotation, cleanup, crash semantics and
+disk-full path — and a new failure mode for when quarantining is what fails. Handing the
+caller the bytes collapses *quarantine*, *stop* and *drop* into one option and keeps decision
+6's shape: hooks, not implementations.
+
+The one thing `StopBuffer` forced open: `b.fail` set the error and the flusher exited, but
+nothing told the writers. A failed buffer never drains, so under the default `Block` policy
+every writer parked forever with only `Stats().Err` to explain it. `Write` now returns
+`ErrFailed` wrapping the cause. That was a pre-existing hole on the `read log` failure path
+too; `StopBuffer` only made it reachable on purpose.
+
 ## Architecture
 
 ```

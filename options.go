@@ -43,8 +43,24 @@ type config struct {
 	maxAttempts int
 	deadLetter  any
 
+	// A nil dlqBackoff inherits backoff, so a caller who tuned WithRetry and
+	// never thought about the dead-letter sink gets their own ladder rather
+	// than the stock one.
+	dlqBackoff  *Backoff
+	dlqAttempts int
+
+	onDecodeFailure func(DecodeFailure) DecodeAction
+
 	checkpointInterval time.Duration
 	observer           Observer
+}
+
+// deadLetterBackoff resolves the ladder the dead-letter sink retries on.
+func (c config) deadLetterBackoff() Backoff {
+	if c.dlqBackoff != nil {
+		return *c.dlqBackoff
+	}
+	return c.backoff
 }
 
 func defaults() config {
@@ -58,6 +74,7 @@ func defaults() config {
 		policy:             Block(),
 		backoff:            Backoff{Jitter: 0.2}.withDefaults(),
 		maxAttempts:        0, // retry forever; a durable buffer should not drop by default
+		dlqAttempts:        3,
 		checkpointInterval: 200 * time.Millisecond,
 	}
 }
@@ -171,6 +188,40 @@ func WithRetry(b Backoff, maxAttempts int) Option {
 // WithDeadLetter sets where batches go once they have exhausted their retries.
 func WithDeadLetter[T any](s Sink[T]) Option {
 	return func(c *config) { c.deadLetter = s }
+}
+
+// WithDeadLetterRetry configures retries for the dead-letter sink itself.
+//
+// It defaults to three attempts on the primary sink's backoff ladder. A
+// dead-letter sink is where records go to survive, so one transient failure
+// should not be the end of them — but a dead-letter sink that is also down must
+// not wedge the pipeline behind it, so unlike WithRetry this is bounded by
+// default. maxAttempts of 0 retries forever.
+//
+// A zero field in b takes its default, exactly as in WithRetry.
+func WithDeadLetterRetry(b Backoff, maxAttempts int) Option {
+	return func(c *config) {
+		d := b.withDefaults()
+		c.dlqBackoff = &d
+		c.dlqAttempts = maxAttempts
+	}
+}
+
+// WithOnDecodeFailure decides what happens to a record the codec will not
+// decode. Payloads are bytes the buffer itself wrote and every record is
+// checksummed, so in practice this means the codec has changed since the record
+// was written — a rollout replaying a backlog the previous build produced.
+//
+// The default drops the record and counts ReasonDecode, which keeps the pipeline
+// moving at the cost of the record. Returning StopBuffer instead keeps the
+// record: delivery halts, the buffer fails, and nothing at or after that LSN is
+// acknowledged, so a restart with a codec that understands it delivers it.
+//
+// The handler runs on the flusher's goroutine, so blocking in it blocks
+// delivery, and calling back into the Buffer from it will deadlock. Writing the
+// payload somewhere is the point; anything slower is not.
+func WithOnDecodeFailure(f func(DecodeFailure) DecodeAction) Option {
+	return func(c *config) { c.onDecodeFailure = f }
 }
 
 // WithObserver attaches callbacks for the events the buffer emits: writes,

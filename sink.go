@@ -90,3 +90,31 @@ func (JSONCodec[T]) Decode(src []byte) (T, error) {
 	err := json.Unmarshal(src, &v)
 	return v, err
 }
+
+// DecodeFailure describes a record read back from the log that the codec
+// refused. It is handed to the WithOnDecodeFailure handler.
+type DecodeFailure struct {
+	// LSN names the record, the same number Batch.ID counts from.
+	LSN uint64
+
+	// Payload is the stored bytes, exactly as Encode produced them. It aliases
+	// an internal read buffer and is only valid until the handler returns: copy
+	// anything you keep.
+	Payload []byte
+
+	// Err is what the codec returned.
+	Err error
+}
+
+// DecodeAction is what the buffer does with a record that would not decode.
+type DecodeAction int
+
+const (
+	// DropRecord discards it and carries on, counting ReasonDecode. The default.
+	DropRecord DecodeAction = iota
+
+	// StopBuffer halts delivery, leaving the record and everything after it
+	// unacknowledged in the log, so a later Open with a codec that understands
+	// them can deliver them.
+	StopBuffer
+)

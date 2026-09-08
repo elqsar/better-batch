@@ -14,6 +14,13 @@
 // drop newest, drop oldest, or block with a deadline and then shed. A full
 // disk flows through the same policy, flagged by [State.DiskFull].
 //
+// What happens to a record that cannot be delivered is likewise the caller's
+// choice. A batch that exhausts its retries goes to the sink named by
+// [WithDeadLetter], which is itself retried ([WithDeadLetterRetry]); a record
+// the codec refuses is handed to [WithOnDecodeFailure], which can quarantine
+// the raw bytes and either drop the record or stop the buffer so a later Open
+// with a working codec can deliver it.
+//
 // The package has no dependencies outside the standard library. Metrics and
 // tracing hook in through [Observer] callbacks and [Buffer.Stats].
 //

@@ -209,6 +209,15 @@ batch.WithDeadLetter[Event](deadLetterSink),
 With a positive attempt limit and no dead-letter sink, exhausted batches are dropped and
 counted (`ReasonRetriesExhausted`).
 
+The dead-letter sink is retried in turn — three attempts on the same ladder by default. It is
+where records go to survive, so one transient failure should not be the end of them; but a
+dead-letter sink that is also down must not wedge the pipeline behind it, so unlike
+`WithRetry` this is bounded by default:
+
+```go
+batch.WithDeadLetterRetry(batch.Backoff{Initial: time.Second}, 5), // 0 retries forever
+```
+
 ---
 
 # Observability
@@ -247,8 +256,11 @@ type Observer struct {
 | `OnBackpressure` | each time the policy is consulted | how often you are saturated, and what you did |
 | `OnCheckpoint` | the low-water mark was persisted | replay window, progress |
 
-`FlushInfo` carries `ID`, `Records`, `Bytes`, `Attempt`, `Duration` and `Err`. Because it
-fires on failures too, one hook gives you both the latency histogram and the error counter.
+`FlushInfo` carries `ID`, `Records`, `Bytes`, `Attempt`, `DeadLetter`, `Duration` and `Err`.
+Because it fires on failures too, one hook gives you both the latency histogram and the error
+counter. `DeadLetter` is true for attempts against the dead-letter sink, which get their own
+`Attempt` count starting from 1 — split on it, or a dead-letter sink stuck retrying reads as
+primary-sink latency.
 
 `DropReason` is `ReasonPolicy`, `ReasonDecode`, or `ReasonRetriesExhausted`, and both it and
 `Decision` implement `String()` so they drop straight into a metric label.
@@ -502,6 +514,10 @@ batch.WithObserver(batch.Observer{
 | `Stats().CheckpointErr` non-nil | checkpointing keeps failing, usually a full disk |
 | `Stats().Err` non-nil | unrecoverable; records stay durable and replay on the next `Open` |
 
+Once `Stats().Err` is set the buffer never drains again, so `Write` and `WriteBatch` reject
+new records with an error matching `ErrFailed`, wrapping the cause. Records already written
+stay durable and replay on the next `Open`.
+
 `Stats().Err` and `CheckpointErr` are different in kind: `CheckpointErr` clears itself once a
 checkpoint succeeds and the buffer keeps working meanwhile, while `Err` is terminal for that
 `Buffer` instance.
@@ -519,6 +535,8 @@ checkpoint succeeds and the buffer keeps working meanwhile, while `Err` is termi
 | `WithMaxInFlight(n)` | 1 | above 1 breaks ordering and the sink must be concurrent-safe |
 | `WithRetry(backoff, maxAttempts)` | 100ms→30s, forever | 0 attempts means retry forever |
 | `WithDeadLetter[T](sink)` | none | where exhausted batches go |
+| `WithDeadLetterRetry(backoff, maxAttempts)` | primary ladder, 3 | retries for the dead-letter sink itself; 0 means forever |
+| `WithOnDecodeFailure(f)` | drop and count | quarantine the raw bytes, or stop rather than lose the record |
 | `WithCheckpointInterval(d)` | 200ms | longer means fewer fsyncs, more replay after a crash |
 | `WithSegmentBytes(n)` | 64 MiB | soft cap; segments may overshoot by one commit batch |
 | `WithMaxRecordBytes(n)` | 4 MiB | largest single encoded record; lowering it below stored records fails `Open` |
@@ -538,8 +556,33 @@ type Codec[T any] interface {
 
 `Encode` appends so it can avoid allocating per record. **`Decode` receives a slice that
 aliases an internal read buffer and is only valid until the next record is read** — copy
-anything you keep. A record that fails to decode is dropped with `ReasonDecode` rather than
-wedging the pipeline behind it.
+anything you keep.
+
+### When a record will not decode
+
+Payloads are bytes the buffer itself wrote, and every record is checksummed, so a decode
+failure in practice means **the codec has changed since the record was written** — a rollout
+replaying a backlog the previous build produced.
+
+By default such a record is dropped with `ReasonDecode` rather than wedging the pipeline
+behind it. `WithOnDecodeFailure` hands you the raw bytes instead, and lets you choose:
+
+```go
+batch.WithOnDecodeFailure(func(f batch.DecodeFailure) batch.DecodeAction {
+    os.WriteFile(filepath.Join(quarantineDir, fmt.Sprint(f.LSN)), f.Payload, 0o600)
+    return batch.DropRecord // ...or batch.StopBuffer
+})
+```
+
+`DropRecord` is the default behaviour, so quarantining costs nothing else. `StopBuffer` halts
+delivery instead: the buffer fails, nothing at or after that LSN is acknowledged, and a
+restart with a codec that understands the record delivers it and everything behind it. That
+is the choice for a buffer whose records must not be lost to a bad deploy — but a stopped
+buffer never drains, so `Write` then returns `ErrFailed` and the backlog stays on disk until
+you fix the codec.
+
+`f.Payload` aliases the read buffer and is only valid until the handler returns, and the
+handler runs on the flusher's goroutine — copy what you keep, and do not block.
 
 ## Operational notes
 

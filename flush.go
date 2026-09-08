@@ -56,6 +56,11 @@ func (b *Buffer[T]) flusher(from uint64) {
 		draining  bool
 		cut       bool // a discontinuity ends this batch early
 
+		// A decode failure the handler answered with StopBuffer ends the flusher
+		// once the good records already read have been dispatched.
+		stopLSN uint64
+		stopErr error
+
 		// A record read across a discontinuity belongs to the next batch, so it
 		// is held over rather than re-read.
 		held     T
@@ -105,8 +110,14 @@ func (b *Buffer[T]) flusher(from uint64) {
 				b.dropped(1, ReasonPolicy)
 				skip = true
 			} else if decoded, derr := b.codec.Decode(payload); derr != nil {
-				// A record that will not decode can never be delivered.
-				// Dropping it is the only alternative to wedging the pipeline.
+				// A record that will not decode can never be delivered by this
+				// codec. Dropping it keeps the pipeline moving; the handler can
+				// ask to stop instead and keep it for a codec that understands
+				// it, which is what a codec changed between runs needs.
+				if b.decodeFailure(lsn, payload, derr) == StopBuffer {
+					stopLSN, stopErr = lsn, derr
+					break
+				}
 				b.dropped(1, ReasonDecode)
 				skip = true
 			} else {
@@ -139,6 +150,35 @@ func (b *Buffer[T]) flusher(from uint64) {
 			wantLSN++
 			nbytes += size
 			rangeTo = lsn
+		}
+
+		if stopErr != nil {
+			// Everything already read is settled either way, so hand it on
+			// before stopping: rangeTo is the last LSN decided, which is
+			// strictly below the record that stopped us. That record and
+			// everything after it stay unacknowledged, so the low-water mark
+			// cannot pass them, persist cannot truncate them away, and the next
+			// Open replays them.
+			switch {
+			case len(records) > 0:
+				b.dispatch(pending[T]{
+					records:   records,
+					id:        id,
+					rangeFrom: rangeFrom,
+					rangeTo:   rangeTo,
+					count:     int64(len(records)),
+					bytes:     nbytes,
+					skipCount: skipCount,
+					skipBytes: skipBytes,
+				})
+			case rangeTo >= rangeFrom:
+				// Only skipped records so far. Acknowledge them rather than
+				// letting the next Open read and re-drop what this pass already
+				// counted.
+				b.complete(rangeFrom, rangeTo, skipCount, skipBytes)
+			}
+			b.fail(fmt.Errorf("batch: decode record %d: %w", stopLSN, stopErr))
+			return
 		}
 
 		// Flush wants everything out now; treat the interval as elapsed rather
@@ -260,57 +300,112 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			b.deadLetter(batch, p)
 			return
 		}
-		// The backoff also ends when DropOldest raises the floor over this
-		// batch: a writer is waiting for the capacity the batch holds, and only
-		// the abandon at the top of this loop can give it back. Waiting out a
-		// retry delay first would leave a policy that exists never to block
-		// blocking for as long as the backoff has grown.
-		timer := time.NewTimer(b.cfg.backoff.delay(attempt))
-		for waiting := true; waiting; {
-			// Take the gate before reading the floor, so a raise between the
-			// two cannot be missed.
-			shed := b.floors.wait()
-			if p.id < b.floor.Load() {
-				break
-			}
-			select {
-			case <-timer.C:
-				waiting = false
-			case <-shed:
-			case <-b.abort:
-				timer.Stop()
-				return // unacknowledged, so the batch is replayed after restart
-			}
+		if !b.awaitRetry(p, b.cfg.backoff, attempt) {
+			return // unacknowledged, so the batch is replayed after restart
 		}
-		timer.Stop()
 	}
 }
 
+// awaitRetry waits out the backoff before the next attempt on p. It returns
+// false when the buffer is aborting and the caller must stop without disposing
+// of the batch.
+//
+// The wait also ends when DropOldest raises the floor over the batch: a writer
+// is waiting for the capacity the batch holds, and only the caller's own floor
+// check can give it back. Waiting out a retry delay first would leave a policy
+// that exists never to block blocking for as long as the backoff has grown.
+func (b *Buffer[T]) awaitRetry(p pending[T], bo Backoff, attempt int) bool {
+	timer := time.NewTimer(bo.delay(attempt))
+	defer timer.Stop()
+	for {
+		// Take the gate before reading the floor, so a raise between the two
+		// cannot be missed.
+		shed := b.floors.wait()
+		if p.id < b.floor.Load() {
+			return true
+		}
+		select {
+		case <-timer.C:
+			return true
+		case <-shed:
+		case <-b.abort:
+			return false
+		}
+	}
+}
+
+// deadLetter hands a batch that exhausted its retries to the dead-letter sink,
+// retrying that sink in turn. The dead-letter sink is where records go to
+// survive, so a single transient failure must not be the end of them — but it
+// is bounded by default, because a dead-letter sink that is also down must not
+// wedge the pipeline behind it.
 func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
-	switch {
-	case b.dlq == nil:
+	if b.dlq == nil {
 		b.dropped(int(p.count), ReasonRetriesExhausted)
-	default:
+		b.completeRange(p)
+		return
+	}
+	bo := b.cfg.deadLetterBackoff()
+	for attempt := 1; ; attempt++ {
+		if p.id < b.floor.Load() {
+			// DropOldest cut into this batch while it was waiting on the
+			// dead-letter sink. Abandoning it whole is what frees the capacity
+			// a writer is parked on.
+			b.dropped(int(p.count), ReasonPolicy)
+			b.completeRange(p)
+			return
+		}
+		batch.Attempt = attempt
+		started := time.Now()
 		err := b.dlq.Flush(b.deliverCtx, batch)
-		if err != nil && b.aborting() {
+		b.observeFlush(FlushInfo{
+			ID:         batch.ID,
+			Records:    int(p.count),
+			Bytes:      int(p.bytes),
+			Attempt:    attempt,
+			DeadLetter: true,
+			Duration:   time.Since(started),
+			Err:        err,
+		})
+		if err == nil {
+			b.counters.deadLettered.Add(uint64(p.count))
+			if f := b.cfg.observer.OnDeadLetter; f != nil {
+				f(int(p.count))
+			}
+			b.completeRange(p)
+			return
+		}
+		b.counters.retries.Add(1)
+
+		if b.aborting() {
 			// The dead-letter sink was cancelled by the shutdown, exactly as the
 			// primary one can be. The records have reached neither, so they are
 			// not dead letters yet: leave the range unacknowledged and let the
 			// next open replay it.
 			return
 		}
-		if err != nil {
+		if b.cfg.dlqAttempts > 0 && attempt >= b.cfg.dlqAttempts {
 			// There is nothing left to try. Counting it beats blocking the
 			// pipeline on a dead-letter sink that is also down.
 			b.dropped(int(p.count), ReasonRetriesExhausted)
-		} else {
-			b.counters.deadLettered.Add(uint64(p.count))
-			if f := b.cfg.observer.OnDeadLetter; f != nil {
-				f(int(p.count))
-			}
+			b.completeRange(p)
+			return
+		}
+		if !b.awaitRetry(p, bo, attempt) {
+			return // aborting: unacknowledged, so the batch replays after restart
 		}
 	}
-	b.completeRange(p)
+}
+
+// decodeFailure asks the configured handler what to do about a record the codec
+// refused. Without one, the record is dropped, which is what the buffer has
+// always done.
+func (b *Buffer[T]) decodeFailure(lsn uint64, payload []byte, err error) DecodeAction {
+	f := b.cfg.onDecodeFailure
+	if f == nil {
+		return DropRecord
+	}
+	return f(DecodeFailure{LSN: lsn, Payload: payload, Err: err})
 }
 
 // completeRange acknowledges everything the batch's range covers: its own
@@ -536,7 +631,13 @@ func (b *Buffer[T]) retryableErr() error {
 	return nil
 }
 
-func (b *Buffer[T]) fail(err error) { b.fatalErr.CompareAndSwap(nil, &err) }
+// fail records an unrecoverable error. The signal is what wakes writers parked
+// on the capacity gate: a failed buffer never drains, so the space they are
+// waiting for is never coming, and admit has to tell them so.
+func (b *Buffer[T]) fail(err error) {
+	b.fatalErr.CompareAndSwap(nil, &err)
+	b.space.signal()
+}
 
 func (b *Buffer[T]) err() error {
 	if p := b.fatalErr.Load(); p != nil {

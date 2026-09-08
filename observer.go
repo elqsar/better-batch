@@ -44,8 +44,13 @@ type FlushInfo struct {
 	Records int
 	Bytes   int
 
-	// Attempt counts from 1.
+	// Attempt counts from 1. The dead-letter sink gets its own count, starting
+	// over from 1 once the primary sink's attempts are exhausted.
 	Attempt int
+
+	// DeadLetter is true when this attempt was against the dead-letter sink
+	// rather than the primary one.
+	DeadLetter bool
 
 	// Duration is how long the sink call took.
 	Duration time.Duration
