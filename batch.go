@@ -17,6 +17,11 @@ var (
 	// ErrFull means the buffer is at capacity and the policy chose to reject.
 	ErrFull = errors.New("batch: buffer is full")
 
+	// ErrTooLarge means the write is larger than the buffer's entire configured
+	// capacity, so no amount of draining can ever admit it. Unlike ErrFull it is
+	// permanent: retrying the same write always fails.
+	ErrTooLarge = errors.New("batch: write exceeds buffer capacity")
+
 	// ErrClosed means the buffer is closing or closed and accepts no writes.
 	ErrClosed = errors.New("batch: buffer is closed")
 
@@ -239,6 +244,9 @@ func (b *Buffer[T]) Write(ctx context.Context, v T) error {
 //
 // Either all of the records are accepted or none are.
 //
+// A batch larger than the whole configured capacity fails immediately with
+// ErrTooLarge, whatever the policy: no amount of draining could admit it.
+//
 // If ctx expires after the records have been staged but before their commit
 // round finishes, WriteBatch returns ErrUncertain wrapping the context error:
 // the records may still be committed and delivered. The buffer settles its own
@@ -271,8 +279,14 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 	}
 
 	n, size := int64(len(vs)), int64(len(enc))
+	if err := b.fits(n, size); err != nil {
+		return err
+	}
+	// One clock for the whole call, so a policy sees how long this write has
+	// been trying whether it was parked on capacity or on a full disk.
+	began := time.Now()
 	for attempt := 1; ; attempt++ {
-		admitted, err := b.admit(ctx, n, size)
+		admitted, err := b.admit(ctx, n, size, began)
 		if err != nil || !admitted {
 			return err
 		}
@@ -302,7 +316,7 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 		// The filesystem is the limit, not the configured capacity. A failed
 		// commit is rolled back by the log, so retrying is safe once the
 		// flusher has drained enough to truncate a segment away.
-		retry, err := b.onDiskFull(ctx, n, size, attempt)
+		retry, err := b.onDiskFull(ctx, n, size, attempt, began)
 		if err != nil || !retry {
 			return err
 		}
@@ -310,13 +324,13 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 }
 
 // onDiskFull runs the backpressure policy for a write the log had no room for.
-func (b *Buffer[T]) onDiskFull(ctx context.Context, n, size int64, attempt int) (bool, error) {
+func (b *Buffer[T]) onDiskFull(ctx context.Context, n, size int64, attempt int, began time.Time) (bool, error) {
 	b.counters.diskFull.Add(1)
 
 	// Take the gate before deciding, so space freed while the policy runs
 	// cannot be missed.
 	waiting := b.space.wait()
-	st := b.state(attempt)
+	st := b.state(attempt, time.Since(began))
 	st.DiskFull = true
 
 	decision := b.cfg.policy.OnFull(ctx, st)
@@ -387,6 +401,20 @@ func (b *Buffer[T]) failure() error {
 	return nil
 }
 
+// fits reports a write no amount of draining can admit. Capacity bounds the
+// whole backlog, so a batch above it fails reserve even against an empty
+// buffer: under Block the writer would wait for space that cannot exist, and
+// under DropOldest it would shed the entire backlog and still not fit.
+func (b *Buffer[T]) fits(n, size int64) error {
+	switch {
+	case b.cfg.maxRecords > 0 && n > b.cfg.maxRecords:
+		return fmt.Errorf("%w: %d records, capacity is %d", ErrTooLarge, n, b.cfg.maxRecords)
+	case b.cfg.maxBytes > 0 && size > b.cfg.maxBytes:
+		return fmt.Errorf("%w: %d bytes, capacity is %d", ErrTooLarge, size, b.cfg.maxBytes)
+	}
+	return nil
+}
+
 // reserve takes capacity if it is available, all or nothing.
 func (b *Buffer[T]) reserve(n, size int64) bool {
 	records := b.pendingRecords.Add(n)
@@ -438,7 +466,7 @@ func (b *Buffer[T]) release(n, size int64) {
 
 // admit applies the backpressure policy until the write fits, is refused, or is
 // dropped. A false first return with a nil error means the policy dropped it.
-func (b *Buffer[T]) admit(ctx context.Context, n, size int64) (bool, error) {
+func (b *Buffer[T]) admit(ctx context.Context, n, size int64, began time.Time) (bool, error) {
 	wait := blockRetryFloor
 	for attempt := 1; ; attempt++ {
 		// Take the gate before testing capacity, so a release that happens
@@ -457,7 +485,7 @@ func (b *Buffer[T]) admit(ctx context.Context, n, size int64) (bool, error) {
 			return false, err
 		}
 
-		st := b.state(attempt)
+		st := b.state(attempt, time.Since(began))
 		decision := b.cfg.policy.OnFull(ctx, st)
 		b.observeBackpressure(st, decision)
 
@@ -532,7 +560,7 @@ func (b *Buffer[T]) raiseFloor(to uint64) {
 	}
 }
 
-func (b *Buffer[T]) state(attempt int) State {
+func (b *Buffer[T]) state(attempt int, waited time.Duration) State {
 	age := b.ages.oldest(time.Now().UnixNano())
 	return State{
 		Records:      b.pendingRecords.Load(),
@@ -542,6 +570,7 @@ func (b *Buffer[T]) state(attempt int) State {
 		OldestAge:    age,
 		SinkFailures: b.sinkFailures.Load(),
 		Attempt:      attempt,
+		Waited:       waited,
 	}
 }
 

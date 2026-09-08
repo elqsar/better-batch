@@ -488,9 +488,19 @@ func (b *Buffer[T]) persist() {
 	b.space.signal()
 }
 
-// Flush waits until everything written before the call has been accepted by the
-// sink. A partial batch is dispatched immediately rather than waiting out the
-// flush interval.
+// Flush waits until every record written before the call has been resolved:
+// accepted by the sink, handed to the dead-letter sink, or dropped — by the
+// backpressure policy, by a decode failure, or by running out of retries.
+//
+// It means "nothing written before this call is still pending", not "everything
+// written before this call reached the sink". The low-water mark it waits on
+// advances past records that were disposed of just as it does past delivered
+// ones, because both are equally done with the log. Compare Stats().Flushed,
+// Dropped and DeadLettered across the call to tell the outcomes apart.
+//
+// A partial batch is dispatched immediately rather than waiting out the flush
+// interval. Flush returns the buffer's fatal error if it has one, or ctx's
+// error if ctx expires first.
 func (b *Buffer[T]) Flush(ctx context.Context) error {
 	target := b.log.DurableLSN()
 	for {

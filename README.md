@@ -169,11 +169,22 @@ Full is a policy decision, not a constant. Every built-in is one line:
 | `Reject()` | fail the write with `ErrFull` |
 | `DropNewest()` | discard the incoming write, count it |
 | `DropOldest()` | discard the head of the backlog to make room |
-| `BlockThenDropOldest(d)` | block for `d`, then start shedding |
+| `BlockThenDropOldest(d)` | block while the backlog is fresher than `d`, then shed |
+
+`BlockThenDropOldest`'s `d` is a staleness budget for the **backlog**, not a per-write
+timeout: a write arriving at a backlog that is already stale sheds straight away instead of
+blocking for `d` first. That is deliberate — with a per-write timer, a sustained outage
+makes every write wait out the full `d` before shedding, so the producer runs at one write
+per `d`, which is the collapse the policy exists to prevent. If you want a deadline that
+belongs to the write, `State.Waited` is it.
 
 The same path handles a full **disk**, distinguished by `State.DiskFull`. Writes then fail
 with `ErrDiskFull` under `Reject`, and the buffer stays usable: space comes back as the sink
 drains and segments are truncated.
+
+A write larger than the whole configured capacity is not a backpressure question at all: no
+amount of draining could admit it, so it fails immediately with `ErrTooLarge` under every
+policy rather than blocking for space that cannot exist.
 
 Custom policies see everything they need to shed intelligently:
 
@@ -186,6 +197,8 @@ batch.WithOnFull(batch.PolicyFunc(func(ctx context.Context, s batch.State) batch
         return batch.DecisionDropOldest  // the destination is down, keep fresh data
     case s.OldestAge > time.Minute:
         return batch.DecisionDropOldest  // this backlog is too stale to be worth sending
+    case s.Waited > 10*time.Second:
+        return batch.DecisionDropOldest  // this write in particular has waited long enough
     default:
         return batch.DecisionBlock
     }
@@ -609,6 +622,13 @@ handler runs on the flusher's goroutine — copy what you keep, and do not block
   while `SyncNever` records are not, so it can survive a machine crash that the log tail did
   not; `Open` clamps it back to the log's durable end. Nothing is lost — everything at or
   below the mark was already acked by the sink.
+- **`Flush(ctx)`** waits until every record written before the call has been *resolved* —
+  accepted by the sink, handed to the dead-letter sink, or dropped by policy, by a decode
+  failure, or by running out of retries. It means "nothing written before this call is still
+  pending", not "everything written before this call reached the sink": the low-water mark it
+  waits on advances past records that were disposed of just as it does past delivered ones.
+  Compare `Stats().Flushed`, `Dropped` and `DeadLettered` across the call to tell the
+  outcomes apart.
 - **`Close(ctx)`** drains, checkpoints, and releases the directory. If `ctx` expires it stops
   waiting and returns the error; nothing is lost, since unacknowledged records replay on the
   next `Open`. A delivery that fails because the shutdown cancelled it is not counted as a
@@ -616,6 +636,8 @@ handler runs on the flusher's goroutine — copy what you keep, and do not block
   context can still stall shutdown.
 - **Sizing:** `WithCapacity` bounds the backlog on disk, so it is the number that decides how
   long an outage you can ride out. At 1 KiB per event, 1 GiB is roughly a million events. It
+  also bounds a single `WriteBatch`: one above either limit fails with `ErrTooLarge`, since an
+  empty buffer could not admit it either. It
   counts every record the log still holds, whatever became of it: with `WithMaxInFlight`
   above 1 a batch that never completes pins the low-water mark, and everything behind it —
   records the sink has already taken, records dropped by policy, records that would not

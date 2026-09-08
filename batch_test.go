@@ -1558,3 +1558,204 @@ func TestDecodeFailureStopsAndReplays(t *testing.T) {
 		t.Fatalf("across the three opens the sinks saw %q, want %q: no record may be lost to a codec change", got, want)
 	}
 }
+
+func TestOversizedWriteFailsInsteadOfBlocking(t *testing.T) {
+	// The bug this guards against is a write that never returns: capacity is
+	// measured against the whole backlog, so a batch above it fails to reserve
+	// even against an empty buffer, and Block waits for space that cannot exist.
+	for _, tc := range []struct {
+		name string
+		cap  Option
+		vs   []string
+	}{
+		{"records", WithCapacity(5, 0), make([]string, 10)},
+		{"bytes", WithCapacity(0, 8), []string{"a record well past eight bytes"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := openBuf(t, t.TempDir(), &recorder{}, fast(tc.cap)...)
+			defer closeBuf(t, b)
+
+			// Generous next to the write, tight next to blocking for ever: if the
+			// deadline is what ends the call, the check below says so.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			err := b.WriteBatch(ctx, tc.vs...)
+			if !errors.Is(err, ErrTooLarge) {
+				t.Fatalf("WriteBatch = %v, want ErrTooLarge", err)
+			}
+			if ctx.Err() != nil {
+				t.Fatal("the context expired, so the write blocked rather than failing on its own")
+			}
+		})
+	}
+}
+
+func TestOversizedWriteFailsUnderEveryPolicy(t *testing.T) {
+	// No policy can make an impossible write possible. DropNewest is the one
+	// that matters most: reporting success for a record that was never going to
+	// be admitted would lose it silently.
+	for name, p := range map[string]Policy{
+		"block":       Block(),
+		"reject":      Reject(),
+		"drop_newest": DropNewest(),
+		"drop_oldest": DropOldest(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := openBuf(t, t.TempDir(), &recorder{}, fast(
+				WithCapacity(5, 0),
+				WithOnFull(p),
+			)...)
+			defer closeBuf(t, b)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := b.WriteBatch(ctx, make([]string, 10)...); !errors.Is(err, ErrTooLarge) {
+				t.Fatalf("WriteBatch = %v, want ErrTooLarge", err)
+			}
+			if s := b.Stats(); s.Written != 0 {
+				t.Fatalf("Written = %d, want 0; the write was refused, so nothing was accepted", s.Written)
+			}
+		})
+	}
+}
+
+func TestUnlimitedCapacityAdmitsAnyWrite(t *testing.T) {
+	// Zero means unlimited, so the size check must not fire on it.
+	sink := &recorder{}
+	b := openBuf(t, t.TempDir(), sink, fast(WithCapacity(0, 0))...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	vs := make([]string, 500)
+	for i := range vs {
+		vs[i] = fmt.Sprintf("e%d", i)
+	}
+	if err := b.WriteBatch(ctx, vs...); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+}
+
+func TestPolicySeesWaitedGrowing(t *testing.T) {
+	// Waited has to measure this write, so it starts near zero however stale the
+	// backlog already is, and grows as the write is reconsidered.
+	sink := &recorder{}
+	sink.failAll.Store(true)
+
+	var mu sync.Mutex
+	var waits []time.Duration
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithCapacity(1, 0),
+		WithRetry(Backoff{Initial: 5 * time.Millisecond, Max: 10 * time.Millisecond, Jitter: 0}, 0),
+		WithOnFull(PolicyFunc(func(_ context.Context, s State) Decision {
+			mu.Lock()
+			waits = append(waits, s.Waited)
+			n := len(waits)
+			mu.Unlock()
+			if n >= 5 {
+				return DecisionReject // terminate rather than block for ever
+			}
+			return DecisionBlock
+		})),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 10 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); errors.Is(err, ErrFull) {
+			break
+		} else if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(waits) < 2 {
+		t.Fatalf("the policy was consulted %d times, too few to say anything about Waited", len(waits))
+	}
+	if waits[0] > 50*time.Millisecond {
+		t.Fatalf("first Waited = %v, want near zero: it measures this write, not the backlog", waits[0])
+	}
+	if waits[len(waits)-1] <= waits[0] {
+		t.Fatalf("Waited did not grow across reconsiderations: %v", waits)
+	}
+}
+
+func TestWaitedDrivesAPerWriteDeadline(t *testing.T) {
+	// The capability the age-based BlockThenDropOldest deliberately does not
+	// offer: a deadline belonging to the write rather than to the backlog.
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithCapacity(5, 0),
+		WithRetry(Backoff{Initial: 5 * time.Millisecond, Max: 10 * time.Millisecond, Jitter: 0}, 0),
+		WithOnFull(PolicyFunc(func(_ context.Context, s State) Decision {
+			if s.Waited > 50*time.Millisecond {
+				return DecisionDropOldest
+			}
+			return DecisionBlock
+		})),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 30 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d: %v; the deadline passed, so the policy must shed instead of blocking on", i, err)
+		}
+	}
+	if s := b.Stats(); s.Dropped == 0 {
+		t.Fatal("nothing was dropped, so the writes cannot have gone through the shedding path")
+	}
+}
+
+func TestFlushReturnsWhenRecordsWereDropped(t *testing.T) {
+	// Flush waits for records to be resolved, not delivered. A batch that ran
+	// out of attempts with no dead-letter sink is resolved: it will never reach
+	// the sink, and Flush must not wait for something that cannot happen.
+	sink := &recorder{}
+	sink.failAll.Store(true)
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Max: 2 * time.Millisecond, Jitter: 0}, 1),
+	)...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 20 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	fctx, fcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer fcancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush: %v; the records were dropped rather than delivered, and Flush waits for records to be resolved", err)
+	}
+	s := b.Stats()
+	if s.Flushed != 0 {
+		t.Fatalf("Flushed = %d, want 0: the sink failed every attempt", s.Flushed)
+	}
+	if s.Dropped == 0 {
+		t.Fatal("nothing was dropped, so this does not exercise the resolved-but-not-delivered path")
+	}
+	if s.PendingRecords != 0 {
+		t.Fatalf("PendingRecords = %d, want 0: Flush returned, so nothing written before it is still pending", s.PendingRecords)
+	}
+}

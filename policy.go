@@ -56,7 +56,10 @@ type State struct {
 	MaxRecords int64
 	MaxBytes   int64
 
-	// OldestAge is how long the oldest unflushed record has been waiting.
+	// OldestAge is how long the oldest unflushed record has been waiting. It
+	// describes the backlog, not the write being decided: it can be well past
+	// any deadline the moment a write arrives, because the records ahead of it
+	// were already stale. Waited is the one that measures this write.
 	OldestAge time.Duration
 
 	// SinkFailures counts consecutive failed flush attempts. Nonzero means the
@@ -75,6 +78,19 @@ type State struct {
 	// blocked write is reconsidered when capacity is released and on a timer, so
 	// the count grows even while the sink is doing nothing at all.
 	Attempt int
+
+	// Waited is how long this write has been trying to be admitted, across
+	// blocking and any disk-full retries. It is near zero the first time the
+	// policy is consulted and grows on each reconsideration, so a policy can
+	// give a write a deadline of its own:
+	//
+	//	if s.Waited > 5*time.Second { return DecisionDropOldest }
+	//
+	// Note what that means under a sustained outage: every write then pays the
+	// full deadline before shedding, and the producer runs at one write per
+	// deadline. BlockThenDropOldest measures the backlog's age instead,
+	// precisely to avoid that.
+	Waited time.Duration
 }
 
 // Policy decides what happens to a write that does not fit.
@@ -105,14 +121,31 @@ func DropNewest() Policy { return constant(DecisionDropNewest) }
 // DropOldest discards the oldest unflushed records to admit new ones.
 func DropOldest() Policy { return constant(DecisionDropOldest) }
 
-// BlockThenDropOldest waits for space for up to the given duration and then
-// starts shedding the backlog. It is a reasonable default for telemetry: a
-// brief sink hiccup applies backpressure, a sustained outage does not take the
-// application down with it.
+// BlockThenDropOldest blocks while the backlog is fresher than grace and sheds
+// it once the oldest unflushed record has been waiting longer than that. It is
+// a reasonable default for telemetry: a brief sink hiccup applies backpressure,
+// a sustained outage does not take the application down with it.
 //
-// The grace period is approximate: it is measured when the buffer reconsiders a
-// blocked write, which it does on a timer as well as whenever capacity is
-// released, so shedding starts within a few milliseconds of the deadline.
+// grace is a staleness budget for the backlog, not a per-write timeout. A write
+// arriving at a backlog that is already stale sheds straight away rather than
+// blocking for grace first, and that is the point: under a sustained outage a
+// per-write timer would make every write wait out the full grace period before
+// shedding, so the producer would run at one write per grace — the collapse the
+// policy exists to prevent. What is bounded here is how far behind the data is
+// allowed to fall, which is the thing a telemetry pipeline actually cares about.
+//
+// A policy that genuinely wants a deadline per write has State.Waited:
+//
+//	batch.PolicyFunc(func(_ context.Context, s batch.State) batch.Decision {
+//		if s.Waited > 5*time.Second {
+//			return batch.DecisionDropOldest
+//		}
+//		return batch.DecisionBlock
+//	})
+//
+// Either way the threshold is approximate: it is measured when the buffer
+// reconsiders a blocked write, which it does on a timer as well as whenever
+// capacity is released, so shedding starts within a few milliseconds of it.
 func BlockThenDropOldest(grace time.Duration) Policy {
 	return PolicyFunc(func(_ context.Context, s State) Decision {
 		if s.OldestAge > grace {

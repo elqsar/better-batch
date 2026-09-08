@@ -120,6 +120,10 @@ func WithMaxRecordBytes(n int) Option {
 // hands the write to the configured Policy. Zero means unlimited, which makes
 // the sink the only thing standing between a burst and a full disk.
 //
+// A single write above either limit is a different matter: it could not be
+// admitted by an empty buffer either, so it fails with ErrTooLarge rather than
+// consulting the Policy about space that can never exist.
+//
 // The backlog is measured against the low-water mark rather than against what
 // the sink has taken, because that is what the disk holds: records behind a
 // batch that has not finished keep their capacity until it lands and the log

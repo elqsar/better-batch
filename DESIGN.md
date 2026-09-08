@@ -380,6 +380,29 @@ same — two things that look alike and are not:
   record", and recovery reads that as a torn tail — so an EIO would have truncated the
   segment. It returns the error separately now, the way the neighbouring read already did.
 
+A later round found the same shape once more — a write that is merely waiting and a write
+that is waiting for the impossible:
+
+- **A `WriteBatch` above the whole capacity blocked for ever.** Capacity bounds the backlog,
+  so a batch larger than it fails to reserve even against an empty buffer. `Block` then
+  waited for space that could never exist, and `DropOldest` shed the entire backlog on every
+  pass and still did not fit; only cancelling the context ended the call. Backpressure is
+  about space that is coming back, so a write no amount of draining can admit no longer asks
+  the policy about it: it fails with `ErrTooLarge` before the admission loop.
+- **`BlockThenDropOldest`'s grace period was not the one its name implied.** It measures the
+  age of the oldest unflushed record, not how long the write in hand has blocked, so a write
+  meeting an already-stale backlog sheds without blocking at all. That behaviour is right and
+  stayed: a per-write timer would make every write pay the full grace during a sustained
+  outage, running the producer at one write per grace — exactly the collapse the policy
+  exists to prevent. What changed is the documentation, which now calls `d` a staleness
+  budget for the backlog, and `State.Waited`, which gives a policy that genuinely wants a
+  per-write deadline the number to test.
+- **`Flush` promised more than it waited for.** Its doc said "accepted by the sink", but it
+  waits on the low-water mark, and the mark advances past records that were dropped or
+  dead-lettered just as readily as past delivered ones — it has to, or one dropped record
+  would wedge it. The contract it actually keeps is "nothing written before this call is
+  still pending", and that is what it says now.
+
 ### Where the time actually goes
 
 Profiling `Write` under `SyncNever` put 61% of CPU in syscalls, and 23% of the total in the
