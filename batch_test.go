@@ -24,14 +24,22 @@ type recorder struct {
 	mu       sync.Mutex
 	batches  []Batch[string]
 	records  []string
+	attempts []time.Time  // when each Flush call arrived
 	failures atomic.Int64 // fail this many more flushes
 	failAll  atomic.Bool
 	delay    atomic.Int64 // nanoseconds to sleep in Flush
+
+	// failWith replaces errSink when set, so a test can drive the retry
+	// classification without needing a second Sink implementation.
+	failWith atomic.Pointer[error]
 }
 
 var errSink = errors.New("sink is down")
 
 func (r *recorder) Flush(ctx context.Context, b Batch[string]) error {
+	r.mu.Lock()
+	r.attempts = append(r.attempts, time.Now())
+	r.mu.Unlock()
 	if d := r.delay.Load(); d > 0 {
 		select {
 		case <-time.After(time.Duration(d)):
@@ -40,6 +48,9 @@ func (r *recorder) Flush(ctx context.Context, b Batch[string]) error {
 		}
 	}
 	if r.failAll.Load() || r.failures.Add(-1) >= 0 {
+		if e := r.failWith.Load(); e != nil {
+			return *e
+		}
 		return errSink
 	}
 	r.mu.Lock()
@@ -47,6 +58,30 @@ func (r *recorder) Flush(ctx context.Context, b Batch[string]) error {
 	r.batches = append(r.batches, b)
 	r.records = append(r.records, b.Records...)
 	return nil
+}
+
+// fail makes every later Flush return err.
+func (r *recorder) fail(err error) {
+	r.failWith.Store(&err)
+	r.failAll.Store(true)
+}
+
+// calls reports how many times Flush has been called.
+func (r *recorder) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.attempts)
+}
+
+// gaps reports the interval between consecutive Flush calls.
+func (r *recorder) gaps() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []time.Duration
+	for i := 1; i < len(r.attempts); i++ {
+		out = append(out, r.attempts[i].Sub(r.attempts[i-1]))
+	}
+	return out
 }
 
 func (r *recorder) seen() []string {
@@ -1757,5 +1792,366 @@ func TestFlushReturnsWhenRecordsWereDropped(t *testing.T) {
 	}
 	if s.PendingRecords != 0 {
 		t.Fatalf("PendingRecords = %d, want 0: Flush returned, so nothing written before it is still pending", s.PendingRecords)
+	}
+}
+
+// errPermanentSink is a stand-in for a destination that has given a verdict:
+// the batch is malformed and asking again will not change that.
+var errRejected = fmt.Errorf("row exceeds column width: %w", ErrPermanent)
+
+func TestPermanentErrorSkipsRemainingAttempts(t *testing.T) {
+	// A verdict is a verdict on the first attempt. Spending the other nine to
+	// collect it again is the "consuming all attempts unnecessarily" half.
+	sink := &recorder{}
+	sink.fail(errRejected)
+	dlq := &recorder{}
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithRetry(Backoff{Initial: 50 * time.Millisecond, Max: time.Second, Jitter: 0}, 10),
+		WithDeadLetter[string](dlq),
+	)...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Write(ctx, "e0"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if n := sink.calls(); n != 1 {
+		t.Fatalf("primary sink was called %d times, want 1: ErrPermanent means stop asking", n)
+	}
+	if got := dlq.seen(); len(got) != 1 || got[0] != "e0" {
+		t.Fatalf("dead-letter sink saw %v, want [e0]", got)
+	}
+	if s := b.Stats(); s.DeadLettered != 1 {
+		t.Fatalf("DeadLettered = %d, want 1", s.DeadLettered)
+	}
+}
+
+func TestPermanentErrorDoesNotWedgeThePipeline(t *testing.T) {
+	// The headline case. Under stock settings a rejected batch retries forever,
+	// holding the only in-flight slot and pinning the low-water mark, so the
+	// whole pipeline stops behind it. Classification is what lets the buffer
+	// step over it.
+	var rejectFirst atomic.Bool
+	rejectFirst.Store(true)
+	var delivered []string
+	var mu sync.Mutex
+	sink := SinkFunc[string](func(_ context.Context, batch Batch[string]) error {
+		if batch.ID == 1 && rejectFirst.Load() {
+			return errRejected
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, batch.Records...)
+		return nil
+	})
+
+	// Deliberately stock: retry forever, one delivery at a time. These are the
+	// defaults that turn one bad batch into a stalled application.
+	b := openBuf(t, t.TempDir(), sink,
+		WithSync(SyncNever, 0),
+		WithFlush(1, 0, 5*time.Millisecond),
+		WithCheckpointInterval(5*time.Millisecond),
+		WithCapacity(4, 0),
+	)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for i := range 20 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d: %v; the rejected batch is wedging the pipeline", i, err)
+		}
+	}
+	if err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	mu.Lock()
+	got := len(delivered)
+	mu.Unlock()
+	if got < 19 {
+		t.Fatalf("delivered %d records, want the 19 that follow the rejected batch", got)
+	}
+	if s := b.Stats(); s.Dropped != 1 {
+		t.Fatalf("Dropped = %d, want 1: the rejected batch had nowhere to go", s.Dropped)
+	}
+}
+
+func TestFailBufferKeepsRecordsForReplay(t *testing.T) {
+	// The fault is the destination, not the batch, so nothing may be disposed
+	// of: a restart with working credentials has to find every record.
+	dir := t.TempDir()
+	sink := &recorder{}
+	sink.fail(errors.New("401 unauthorized"))
+	dlq := &recorder{}
+	b := openBuf(t, dir, sink, fast(
+		WithDeadLetter[string](dlq),
+		WithOnSinkError(func(SinkFailure) RetryDecision {
+			return RetryDecision{Action: FailBuffer}
+		}),
+	)...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 5 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// The failure has to reach a writer rather than only Stats.
+	deadline := time.Now().Add(2 * time.Second)
+	var writeErr error
+	for time.Now().Before(deadline) {
+		if writeErr = b.Write(ctx, "after"); writeErr != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !errors.Is(writeErr, ErrFailed) {
+		t.Fatalf("Write after FailBuffer = %v, want ErrFailed", writeErr)
+	}
+	if s := b.Stats(); s.Err == nil {
+		t.Fatal("Stats().Err is nil, so nothing records why the buffer stopped")
+	} else if s.DeadLettered != 0 || s.Dropped != 0 {
+		t.Fatalf("DeadLettered=%d Dropped=%d, want 0 and 0: FailBuffer disposes of nothing", s.DeadLettered, s.Dropped)
+	}
+	if got := dlq.seen(); len(got) != 0 {
+		t.Fatalf("dead-letter sink saw %v, want nothing", got)
+	}
+	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ccancel()
+	_ = b.Close(cctx) // returns the fatal error by design
+
+	// Reopen with a healthy sink: everything written must still be there.
+	healthy := &recorder{}
+	b2 := openBuf(t, dir, healthy, fast()...)
+	defer closeBuf(t, b2)
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(healthy.seen()) >= 5 {
+			break
+		}
+		_ = b2.Flush(rctx)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := healthy.seen(); len(got) < 5 {
+		t.Fatalf("after reopen the sink saw %v, want the 5 records FailBuffer kept", got)
+	}
+}
+
+func TestRetryAfterOverridesTheBackoff(t *testing.T) {
+	// The ladder is deliberately far away from the override in both directions,
+	// so neither result can be produced by the ladder alone.
+	for _, tc := range []struct {
+		name     string
+		override time.Duration
+		ladder   Backoff
+		min, max time.Duration
+	}{
+		// Ladder far shorter than the override: waiting longer proves the
+		// override was used.
+		{"slower than the ladder", 200 * time.Millisecond,
+			Backoff{Initial: time.Millisecond, Max: 2 * time.Millisecond, Jitter: 0},
+			150 * time.Millisecond, 2 * time.Second},
+		// Ladder far longer: returning sooner proves the same.
+		{"faster than the ladder", 20 * time.Millisecond,
+			Backoff{Initial: 5 * time.Second, Max: 10 * time.Second, Jitter: 0},
+			10 * time.Millisecond, time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &recorder{}
+			sink.failures.Store(2) // fail twice, then accept
+			sink.failWith.Store(func() *error {
+				e := RetryAfter(tc.override, errors.New("throttled"))
+				return &e
+			}())
+			b := openBuf(t, t.TempDir(), sink, fast(WithRetry(tc.ladder, 0))...)
+			defer closeBuf(t, b)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := b.Write(ctx, "e0"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := b.Flush(ctx); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			gaps := sink.gaps()
+			if len(gaps) < 2 {
+				t.Fatalf("only %d gaps between attempts, want 2", len(gaps))
+			}
+			for i, g := range gaps[:2] {
+				if g < tc.min || g > tc.max {
+					t.Fatalf("gap %d was %v, want between %v and %v: the sink's delay must replace the ladder", i, g, tc.min, tc.max)
+				}
+			}
+		})
+	}
+}
+
+func TestClassifierDoesNotRunOnShutdownCancellation(t *testing.T) {
+	// Close's deadline cancels the delivery context and the sink returns that
+	// like any other error. A handler shown it could reasonably call the batch
+	// permanent — so the classification must not be acted on during shutdown,
+	// or records are dead-lettered by a timeout rather than by a verdict.
+	dir := t.TempDir()
+	sink := &recorder{}
+	sink.delay.Store(int64(time.Hour)) // blocks until its context is cancelled
+	dlq := &recorder{}
+	b := openBuf(t, dir, sink, fast(
+		WithDeadLetter[string](dlq),
+		WithOnSinkError(func(SinkFailure) RetryDecision {
+			return RetryDecision{Action: DeadLetterBatch}
+		}),
+	)...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 3 {
+		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // let the batch reach the sink
+
+	cctx, ccancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer ccancel()
+	_ = b.Close(cctx) // times out by design
+
+	if s := b.Stats(); s.DeadLettered != 0 || s.Dropped != 0 {
+		t.Fatalf("DeadLettered=%d Dropped=%d, want 0 and 0: the shutdown cancelled the sink, it did not reject the batch", s.DeadLettered, s.Dropped)
+	}
+	if got := dlq.seen(); len(got) != 0 {
+		t.Fatalf("dead-letter sink saw %v during a shutdown, want nothing", got)
+	}
+
+	// And the records survived to be delivered by the next run.
+	healthy := &recorder{}
+	b2 := openBuf(t, dir, healthy, fast()...)
+	defer closeBuf(t, b2)
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(healthy.seen()) >= 3 {
+			break
+		}
+		_ = b2.Flush(rctx)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := healthy.seen(); len(got) < 3 {
+		t.Fatalf("after reopen the sink saw %v, want the 3 records the shutdown kept", got)
+	}
+}
+
+func TestDeadLetterSinkClassification(t *testing.T) {
+	// A dead-letter sink that rejects permanently has nowhere further to send
+	// the batch, so the verdict means give up now rather than work through the
+	// three default attempts to the same place.
+	sink := &recorder{}
+	sink.fail(errSink)
+	dlq := &recorder{}
+	dlq.fail(errRejected)
+
+	var sawDeadLetter atomic.Bool
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Max: 2 * time.Millisecond, Jitter: 0}, 1),
+		WithDeadLetter[string](dlq),
+		WithOnSinkError(func(f SinkFailure) RetryDecision {
+			if f.DeadLetter {
+				sawDeadLetter.Store(true)
+				return RetryDecision{Action: DeadLetterBatch}
+			}
+			return RetryDecision{} // the primary sink retries normally
+		}),
+	)...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Write(ctx, "e0"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !sawDeadLetter.Load() {
+		t.Fatal("the handler never saw SinkFailure.DeadLetter, so it cannot answer the two sinks differently")
+	}
+	if n := dlq.calls(); n != 1 {
+		t.Fatalf("dead-letter sink was called %d times, want 1 rather than the default 3", n)
+	}
+	if s := b.Stats(); s.Dropped != 1 || s.DeadLettered != 0 {
+		t.Fatalf("Dropped=%d DeadLettered=%d, want 1 and 0", s.Dropped, s.DeadLettered)
+	}
+}
+
+func TestNoClassifierIsUnchanged(t *testing.T) {
+	// The compatibility guard: a plain error with no handler and no sentinel
+	// retries on the ladder exactly as it always did.
+	sink := &recorder{}
+	sink.failures.Store(3)
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithRetry(Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Jitter: 0}, 0),
+	)...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Write(ctx, "e0"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := sink.seen(); len(got) != 1 || got[0] != "e0" {
+		t.Fatalf("sink saw %v, want [e0] after retrying through the failures", got)
+	}
+	if s := b.Stats(); s.Dropped != 0 || s.DeadLettered != 0 {
+		t.Fatalf("Dropped=%d DeadLettered=%d, want 0 and 0: a plain error is transient", s.Dropped, s.DeadLettered)
+	}
+}
+
+func TestObserverReportsRetryAction(t *testing.T) {
+	// A rejection and an outage must not be the same increment on the same
+	// counter: they want opposite responses from whoever is paged.
+	sink := &recorder{}
+	sink.fail(errRejected)
+	var mu sync.Mutex
+	var actions []RetryAction
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithObserver(Observer{OnFlush: func(f FlushInfo) {
+			if f.Err != nil {
+				mu.Lock()
+				actions = append(actions, f.Action)
+				mu.Unlock()
+			}
+		}}),
+	)...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Write(ctx, "e0"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(actions) != 1 || actions[0] != DeadLetterBatch {
+		t.Fatalf("OnFlush reported actions %v, want one DeadLetterBatch", actions)
+	}
+	if DeadLetterBatch.String() != "dead_letter" {
+		t.Fatalf("RetryAction.String() = %q, want a usable metric label", DeadLetterBatch.String())
 	}
 }

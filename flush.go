@@ -84,6 +84,14 @@ func (b *Buffer[T]) flusher(from uint64) {
 	}
 
 	for {
+		// A delivery can fail the buffer too, now that a sink error can be
+		// classified FailBuffer, and it does so from its own goroutine. Without
+		// this the flusher would carry on feeding batches to a destination that
+		// has already been judged hopeless, one rejected call at a time. What
+		// has been read stays unacknowledged, so the next Open replays it.
+		if b.err() != nil {
+			return
+		}
 		if hasHeld && len(records) == 0 {
 			startBatch(heldLSN)
 			records = append(records, held)
@@ -271,11 +279,19 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 		batch.Attempt = attempt
 		started := time.Now()
 		err := b.sink.Flush(b.deliverCtx, batch)
+		d := b.classify(SinkFailure{
+			ID:      batch.ID,
+			Records: int(p.count),
+			Bytes:   int(p.bytes),
+			Attempt: attempt,
+			Err:     err,
+		})
 		b.observeFlush(FlushInfo{
 			ID:       batch.ID,
 			Records:  int(p.count),
 			Bytes:    int(p.bytes),
 			Attempt:  attempt,
+			Action:   d.Action,
 			Duration: time.Since(started),
 			Err:      err,
 		})
@@ -293,6 +309,27 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			// shutdown talking, not the sink's verdict on the batch. Retries
 			// are not exhausted and the records are not dead letters: leave the
 			// range unacknowledged and let the next open replay it.
+			//
+			// The classification is discarded here rather than acted on, and
+			// the order is the point: a handler shown a cancelled context could
+			// reasonably call it permanent, and disposing of records on that
+			// answer during a shutdown is the same bug as counting one as
+			// retries running out.
+			return
+		}
+
+		switch d.Action {
+		case DeadLetterBatch:
+			// The destination has given a verdict. Spending the remaining
+			// attempts would only collect it again, while the batch holds its
+			// delivery slot and the capacity behind it.
+			b.deadLetter(batch, p)
+			return
+		case FailBuffer:
+			// The batch is fine and the destination is not, so nothing is
+			// disposed of: the range stays unacknowledged and the next Open
+			// delivers it.
+			b.fail(fmt.Errorf("batch: sink rejected batch %d: %w", batch.ID, err))
 			return
 		}
 
@@ -300,22 +337,59 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			b.deadLetter(batch, p)
 			return
 		}
-		if !b.awaitRetry(p, b.cfg.backoff, attempt) {
+		if !b.awaitRetry(p, b.retryDelay(d, b.cfg.backoff, attempt)) {
 			return // unacknowledged, so the batch is replayed after restart
 		}
 	}
 }
 
-// awaitRetry waits out the backoff before the next attempt on p. It returns
-// false when the buffer is aborting and the caller must stop without disposing
-// of the batch.
+// classify decides what to do about a batch the sink refused. Without a handler
+// it reads the error itself, so a sink that wraps ErrPermanent or RetryAfter is
+// understood with nothing configured.
+//
+// A nil error is classified too, so that the caller has one value to report to
+// the observer either way; every branch leaves it as the zero RetryBatch, which
+// the success path ignores.
+func (b *Buffer[T]) classify(f SinkFailure) RetryDecision {
+	if f.Err == nil {
+		return RetryDecision{}
+	}
+	if h := b.cfg.onSinkError; h != nil {
+		return h(f)
+	}
+	var ra *retryAfterError
+	switch {
+	case errors.Is(f.Err, ErrPermanent):
+		return RetryDecision{Action: DeadLetterBatch}
+	case errors.As(f.Err, &ra):
+		return RetryDecision{After: ra.RetryDelay()}
+	}
+	return RetryDecision{}
+}
+
+// retryDelay resolves how long to wait before the next attempt: what the sink
+// asked for, or the configured ladder when it asked for nothing.
+func (b *Buffer[T]) retryDelay(d RetryDecision, bo Backoff, attempt int) time.Duration {
+	if d.Action == RetryBatch && d.After > 0 {
+		return d.After
+	}
+	return bo.delay(attempt)
+}
+
+// awaitRetry waits out delay before the next attempt on p. It returns false
+// when the buffer is aborting and the caller must stop without disposing of the
+// batch.
+//
+// The delay arrives resolved rather than as a ladder and an attempt number,
+// because a sink that has said when to come back overrides the ladder, and
+// working that out in one place keeps the two retry loops honest.
 //
 // The wait also ends when DropOldest raises the floor over the batch: a writer
 // is waiting for the capacity the batch holds, and only the caller's own floor
 // check can give it back. Waiting out a retry delay first would leave a policy
 // that exists never to block blocking for as long as the backoff has grown.
-func (b *Buffer[T]) awaitRetry(p pending[T], bo Backoff, attempt int) bool {
-	timer := time.NewTimer(bo.delay(attempt))
+func (b *Buffer[T]) awaitRetry(p pending[T], delay time.Duration) bool {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	for {
 		// Take the gate before reading the floor, so a raise between the two
@@ -358,12 +432,21 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 		batch.Attempt = attempt
 		started := time.Now()
 		err := b.dlq.Flush(b.deliverCtx, batch)
+		d := b.classify(SinkFailure{
+			ID:         batch.ID,
+			Records:    int(p.count),
+			Bytes:      int(p.bytes),
+			Attempt:    attempt,
+			DeadLetter: true,
+			Err:        err,
+		})
 		b.observeFlush(FlushInfo{
 			ID:         batch.ID,
 			Records:    int(p.count),
 			Bytes:      int(p.bytes),
 			Attempt:    attempt,
 			DeadLetter: true,
+			Action:     d.Action,
 			Duration:   time.Since(started),
 			Err:        err,
 		})
@@ -381,9 +464,24 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 			// The dead-letter sink was cancelled by the shutdown, exactly as the
 			// primary one can be. The records have reached neither, so they are
 			// not dead letters yet: leave the range unacknowledged and let the
-			// next open replay it.
+			// next open replay it. The classification is discarded for the same
+			// reason it is in deliver.
 			return
 		}
+
+		switch d.Action {
+		case DeadLetterBatch:
+			// This is the dead-letter sink, so there is nowhere further to send
+			// the batch: refusing it permanently means giving up now rather
+			// than working through the attempts to the same end.
+			b.dropped(int(p.count), ReasonRetriesExhausted)
+			b.completeRange(p)
+			return
+		case FailBuffer:
+			b.fail(fmt.Errorf("batch: dead-letter sink rejected batch %d: %w", batch.ID, err))
+			return // unacknowledged, so the batch replays on the next Open
+		}
+
 		if b.cfg.dlqAttempts > 0 && attempt >= b.cfg.dlqAttempts {
 			// There is nothing left to try. Counting it beats blocking the
 			// pipeline on a dead-letter sink that is also down.
@@ -391,7 +489,7 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 			b.completeRange(p)
 			return
 		}
-		if !b.awaitRetry(p, bo, attempt) {
+		if !b.awaitRetry(p, b.retryDelay(d, bo, attempt)) {
 			return // aborting: unacknowledged, so the batch replays after restart
 		}
 	}

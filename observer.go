@@ -52,6 +52,13 @@ type FlushInfo struct {
 	// rather than the primary one.
 	DeadLetter bool
 
+	// Action is what the buffer decided to do about a failed attempt: retry it,
+	// give up on the batch, or stop. Without it a rejection and an outage are
+	// the same increment on the same counter, and the two want opposite
+	// responses from whoever is paged. It is RetryBatch and carries no meaning
+	// when Err is nil.
+	Action RetryAction
+
 	// Duration is how long the sink call took.
 	Duration time.Duration
 

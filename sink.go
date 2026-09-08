@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 )
 
 // Batch is a group of records handed to a sink.
@@ -36,7 +38,14 @@ func (b Batch[T]) Len() int { return len(b.Records) }
 //
 // Returning nil means the records are durably handled downstream and the buffer
 // may forget them. Returning an error causes the batch to be retried with the
-// same ID.
+// same ID, on the ladder set by [WithRetry].
+//
+// An error that will never succeed should say so, or the buffer keeps asking:
+// wrap [ErrPermanent] and the batch goes to the dead-letter sink instead of
+// spending its attempts. [RetryAfter] wraps an error with a delay for a
+// destination that has said when to come back. A sink whose errors come from
+// somebody else's client library is classified from the outside instead, with
+// [WithOnSinkError].
 type Sink[T any] interface {
 	Flush(ctx context.Context, b Batch[T]) error
 }
@@ -118,3 +127,108 @@ const (
 	// them can deliver them.
 	StopBuffer
 )
+
+// SinkFailure describes a batch the sink refused. It is handed to the
+// WithOnSinkError handler.
+type SinkFailure struct {
+	// ID names the batch, the same value as Batch.ID.
+	ID      uint64
+	Records int
+	Bytes   int
+
+	// Attempt counts from 1. The dead-letter sink gets its own count, starting
+	// over from 1 once the primary sink's attempts are exhausted.
+	Attempt int
+
+	// DeadLetter is true when the dead-letter sink refused the batch rather
+	// than the primary one, so a handler can answer the two differently.
+	DeadLetter bool
+
+	// Err is what the sink returned.
+	Err error
+}
+
+// RetryAction is what the buffer does with a batch the sink refused.
+type RetryAction int
+
+const (
+	// RetryBatch tries again on the configured ladder, up to the attempt limit
+	// if there is one. The default, and what every sink error did before there
+	// was anything to say otherwise.
+	RetryBatch RetryAction = iota
+
+	// DeadLetterBatch gives up on this batch now, without spending the attempts
+	// it has left: the destination will not accept it however often it is
+	// asked. The batch goes to the dead-letter sink, or is dropped and counted
+	// ReasonRetriesExhausted if there is none.
+	DeadLetterBatch
+
+	// FailBuffer stops the buffer, leaving this batch and everything after it
+	// unacknowledged so a later Open can deliver them. It is for a destination
+	// that is wrong rather than a batch that is — bad credentials, a misrouted
+	// endpoint — where dead-lettering the backlog one batch at a time would
+	// empty it into the quarantine over a fault that a restart fixes.
+	FailBuffer
+)
+
+// String makes a RetryAction usable directly as a metric label.
+func (a RetryAction) String() string {
+	switch a {
+	case RetryBatch:
+		return "retry"
+	case DeadLetterBatch:
+		return "dead_letter"
+	case FailBuffer:
+		return "fail"
+	default:
+		return "unknown"
+	}
+}
+
+// RetryDecision is a RetryAction with an optional delay before the next
+// attempt. Its zero value retries on the configured backoff, which is what
+// happens when nothing is configured.
+type RetryDecision struct {
+	Action RetryAction
+
+	// After replaces the backoff ladder for the next attempt only, for a sink
+	// that has been told when to come back: an HTTP Retry-After, a broker's
+	// throttle hint. Zero uses the configured ladder. It is ignored unless
+	// Action is RetryBatch, and it does not stop the attempt limit counting —
+	// a destination that keeps asking for more time still runs out of tries.
+	After time.Duration
+}
+
+// RetryAfter wraps err with how long to wait before the next attempt, for a
+// sink that has been told when to come back. The buffer uses the delay in
+// place of its backoff ladder for that one attempt.
+//
+//	if resp.StatusCode == http.StatusTooManyRequests {
+//		return batch.RetryAfter(retryAfter(resp), fmt.Errorf("throttled"))
+//	}
+//
+// A WithOnSinkError handler takes precedence, so a caller who wants to cap or
+// ignore what a destination asks for can.
+func RetryAfter(d time.Duration, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &retryAfterError{d: d, err: err}
+}
+
+// retryAfterError carries a sink's requested delay alongside its error. It is
+// unexported because the delay is read through errors.As on the concrete type,
+// and a caller building one directly would be duplicating RetryAfter.
+type retryAfterError struct {
+	d   time.Duration
+	err error
+}
+
+func (e *retryAfterError) Error() string {
+	return fmt.Sprintf("%s (retry after %s)", e.err, e.d)
+}
+
+func (e *retryAfterError) Unwrap() error { return e.err }
+
+// RetryDelay reports the delay the sink asked for.
+func (e *retryAfterError) RetryDelay() time.Duration { return e.d }

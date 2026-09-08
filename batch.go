@@ -36,6 +36,19 @@ var (
 	// Stats().Err.
 	ErrFailed = errors.New("batch: buffer has failed")
 
+	// ErrPermanent marks a sink error the buffer should not retry. A sink wraps
+	// it when the destination has given a verdict rather than had a problem — a
+	// malformed record, a schema violation, a 400 — and the batch goes to the
+	// dead-letter sink instead of spending its attempts:
+	//
+	//	return fmt.Errorf("row exceeds column width: %w", batch.ErrPermanent)
+	//
+	// Without it a rejected batch retries forever under the default settings,
+	// holding its delivery slot and the capacity behind it. A WithOnSinkError
+	// handler overrides it, so a caller adapting somebody else's client can
+	// classify errors it never wrote.
+	ErrPermanent = errors.New("batch: sink rejected the batch permanently")
+
 	// ErrUncertain means the write's context expired while its records were
 	// waiting for their commit round. They were staged, so they may still be
 	// committed and delivered to the sink; the buffer finishes accounting for

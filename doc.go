@@ -19,7 +19,10 @@
 // [WithDeadLetter], which is itself retried ([WithDeadLetterRetry]); a record
 // the codec refuses is handed to [WithOnDecodeFailure], which can quarantine
 // the raw bytes and either drop the record or stop the buffer so a later Open
-// with a working codec can deliver it.
+// with a working codec can deliver it. Whether a batch has exhausted anything
+// is a question in its own right: [WithOnSinkError] separates a destination
+// having a problem from one giving a verdict, so a rejection is not retried
+// until it stalls the pipeline behind it.
 //
 // The package has no dependencies outside the standard library. Metrics and
 // tracing hook in through [Observer] callbacks and [Buffer.Stats].

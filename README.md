@@ -231,6 +231,60 @@ dead-letter sink that is also down must not wedge the pipeline behind it, so unl
 batch.WithDeadLetterRetry(batch.Backoff{Initial: time.Second}, 5), // 0 retries forever
 ```
 
+### Not every error deserves a retry
+
+Retrying forever is right for a destination having a problem and wrong for one giving a
+verdict, and one setting cannot serve both. A batch the destination will never accept — a
+malformed record, a schema violation, a 400 — otherwise retries until something gives:
+it holds its delivery slot, so with the default `MaxInFlight` of 1 nothing else is
+delivered; its records are never acknowledged, so the low-water mark cannot move and the
+capacity behind it is never released; and the writers fill the buffer and park. One bad
+batch stops the application. Bounding the attempts instead only moves the problem onto the
+outage, which now dead-letters records that would have succeeded.
+
+A sink written for this package says so in the error it returns, and needs no configuration:
+
+```go
+return fmt.Errorf("row exceeds column width: %w", batch.ErrPermanent)  // dead-letter it
+return batch.RetryAfter(retryAfter(resp), errThrottled)                // come back in 30s
+```
+
+A sink returning somebody else's error type is classified from the outside:
+
+```go
+batch.WithOnSinkError(func(f batch.SinkFailure) batch.RetryDecision {
+    var e *googleapi.Error
+    if !errors.As(f.Err, &e) {
+        return batch.RetryDecision{}  // unrecognised: retry on the ladder
+    }
+    switch {
+    case e.Code == 401 || e.Code == 403:
+        // The destination is wrong, not the batch. Stop and keep everything:
+        // dead-lettering the backlog over a credential a restart fixes would
+        // empty it into the quarantine.
+        return batch.RetryDecision{Action: batch.FailBuffer}
+    case e.Code == 429:
+        return batch.RetryDecision{After: retryAfter(e)}
+    case e.Code >= 400 && e.Code < 500:
+        return batch.RetryDecision{Action: batch.DeadLetterBatch}
+    default:
+        return batch.RetryDecision{}  // 5xx: the destination is having a bad day
+    }
+})
+```
+
+| Action | What happens |
+| --- | --- |
+| `RetryBatch` (zero value) | retry on the configured ladder, up to the attempt limit |
+| `DeadLetterBatch` | stop asking; to the dead-letter sink, or dropped and counted |
+| `FailBuffer` | stop the buffer; nothing is disposed of and the next `Open` replays it |
+
+`RetryDecision.After` replaces the backoff for one attempt and does not stop the attempt
+limit counting, so a destination that keeps asking for more time still runs out of tries.
+The handler never sees an error caused by `Close` cancelling delivery — that error is the
+shutdown talking, not the sink's verdict, and disposing of records on it is a bug the buffer
+has had once already.
+
 ---
 
 # Observability
@@ -522,6 +576,7 @@ batch.WithObserver(batch.Observer{
 | `OnDrop` rate > 0 | you are losing data, whatever the reason says |
 | `Stats().OldestAge` climbing | the sink cannot keep up; the backlog is going stale |
 | `Stats().SinkFailures` > 0 for minutes | the destination is down, not just slow |
+| `OnFlush` with `Action == DeadLetterBatch` | the destination is rejecting your content, not failing to receive it |
 | `OnBackpressure` with `disk_full=true` | the filesystem is the constraint now |
 | `Stats().PendingBytes` near `WithCapacity` | the next burst starts shedding or blocking |
 | `Stats().CheckpointErr` non-nil | checkpointing keeps failing, usually a full disk |

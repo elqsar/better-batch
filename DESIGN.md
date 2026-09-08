@@ -397,6 +397,18 @@ that is waiting for the impossible:
   exists to prevent. What changed is the documentation, which now calls `d` a staleness
   budget for the backlog, and `State.Waited`, which gives a policy that genuinely wants a
   per-write deadline the number to test.
+- **One rejected batch stopped everything.** Every sink error took the same ladder, and the
+  default is to retry forever — right for an outage, and a stall for a batch the destination
+  will never accept. That batch held the only in-flight delivery slot, so nothing else was
+  delivered; its records were never acknowledged, so the mark could not move and the
+  capacity behind it was never released; and the writers filled the buffer and parked. No
+  error, no timeout, no way to tell from the outside. The package had already made this
+  decision once, for records the codec refuses, and `WithOnSinkError` is the same decision
+  where it costs more: a verdict goes to the dead-letter sink instead of spending attempts,
+  and a destination that is wrong rather than unlucky stops the buffer with everything kept.
+  The classification is read after the shutdown check, not before — a handler shown a
+  cancelled context could reasonably call it permanent, and that is how the cancelled-
+  shutdown bug two rounds ago would have come back through a new door.
 - **`Flush` promised more than it waited for.** Its doc said "accepted by the sink", but it
   waits on the low-water mark, and the mark advances past records that were dropped or
   dead-lettered just as readily as past delivered ones — it has to, or one dropped record

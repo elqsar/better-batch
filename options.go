@@ -50,6 +50,7 @@ type config struct {
 	dlqAttempts int
 
 	onDecodeFailure func(DecodeFailure) DecodeAction
+	onSinkError     func(SinkFailure) RetryDecision
 
 	checkpointInterval time.Duration
 	observer           Observer
@@ -226,6 +227,39 @@ func WithDeadLetterRetry(b Backoff, maxAttempts int) Option {
 // payload somewhere is the point; anything slower is not.
 func WithOnDecodeFailure(f func(DecodeFailure) DecodeAction) Option {
 	return func(c *config) { c.onDecodeFailure = f }
+}
+
+// WithOnSinkError classifies the errors a sink returns, so that a destination
+// having a problem and a destination giving a verdict stop sharing one retry
+// ladder.
+//
+// They are not the same failure and one setting cannot serve both. Retrying
+// forever is right for an outage and is the default for that reason; applied to
+// a batch the destination will never accept, it is a stall. That batch holds
+// its delivery slot, so with the default MaxInFlight of 1 nothing else is
+// delivered; its records are never acknowledged, so the low-water mark cannot
+// move and the capacity behind it is never released; and the writers fill the
+// buffer and park. Bounding the attempts instead only moves the problem onto
+// the outage, which now dead-letters records that would have succeeded.
+//
+// The handler returns RetryBatch to use the configured ladder, DeadLetterBatch
+// to stop asking and send this batch to the dead-letter sink, or FailBuffer to
+// stop the buffer with everything kept. Reach for FailBuffer when the fault is
+// the destination rather than the batch — bad credentials, a misrouted
+// endpoint — since dead-lettering would then empty the backlog into the
+// quarantine over something a restart fixes. RetryDecision.After overrides the
+// backoff for one attempt, for a destination that says when to come back.
+//
+// A sink written for this package can wrap ErrPermanent or RetryAfter instead
+// and skip the handler entirely; the handler is what a sink returning somebody
+// else's error type needs, since it can match on that type from the outside.
+//
+// It runs on the delivery goroutine, after the sink call it is deciding about,
+// and never for an error caused by Close cancelling delivery — that error is
+// the shutdown talking, not the sink's verdict. Calling back into the Buffer
+// from it will deadlock.
+func WithOnSinkError(f func(SinkFailure) RetryDecision) Option {
+	return func(c *config) { c.onSinkError = f }
 }
 
 // WithObserver attaches callbacks for the events the buffer emits: writes,
