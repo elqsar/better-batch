@@ -79,6 +79,13 @@ type Buffer[T any] struct {
 	ages           ageTracker // age of the oldest unflushed record
 	sinkFailures   atomic.Int64
 
+	// failingBatches counts deliveries that have failed at least once and have
+	// not yet resolved. With MaxInFlight above 1 a healthy batch's success must
+	// not zero sinkFailures while another batch is still failing: a destination
+	// that rejects one batch and takes every other one is exactly the case the
+	// counter exists to report, and the successes would otherwise erase it.
+	failingBatches atomic.Int64
+
 	// floor is the LSN below which records have been abandoned by DropOldest.
 	floor atomic.Uint64
 

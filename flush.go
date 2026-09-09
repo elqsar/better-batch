@@ -263,6 +263,17 @@ func (b *Buffer[T]) dispatch(p pending[T]) bool {
 }
 
 func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
+	// failing records whether this batch is counted in failingBatches. Every
+	// way out of the delivery has to give the count back — success, a verdict,
+	// exhausted retries, a raised floor, a shutdown — and deadLetter runs
+	// inside this call, so the release is deferred rather than repeated.
+	failing := false
+	defer func() {
+		if failing {
+			b.failingBatches.Add(-1)
+		}
+	}()
+
 	for attempt := 1; ; attempt++ {
 		// The floor is compared against the first record, not against rangeFrom:
 		// the range also covers LSNs that carry no record — skipped ones, and
@@ -296,12 +307,27 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			Err:      err,
 		})
 		if err == nil {
-			b.sinkFailures.Store(0)
+			// Leave the failing set before testing it, so a batch that recovers
+			// on its own does not read itself as a reason to stay armed.
+			if failing {
+				b.failingBatches.Add(-1)
+				failing = false
+			}
+			// The run ends only once nothing else is still failing. Under
+			// MaxInFlight above 1 this batch's success says nothing about a
+			// different one that the sink is still refusing.
+			if b.failingBatches.Load() == 0 {
+				b.sinkFailures.Store(0)
+			}
 			b.counters.flushed.Add(uint64(p.count))
 			b.completeRange(p)
 			return
 		}
 		b.sinkFailures.Add(1)
+		if !failing {
+			failing = true
+			b.failingBatches.Add(1)
+		}
 		b.counters.retries.Add(1)
 
 		if b.aborting() {
