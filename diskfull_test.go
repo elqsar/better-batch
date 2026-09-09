@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -22,12 +23,32 @@ func withWriteFault(fn func(*os.File, []byte) (int, error)) Option {
 // segment appends and the LSN reservation, and a test usually wants one of them.
 func isSegment(f *os.File) bool { return strings.HasSuffix(f.Name(), ".log") }
 
+// noRoom is what a filesystem out of room looks like coming back from a write.
+// Production never returns a bare errno: os.File.Write wraps it in a PathError,
+// and the classifier has to see through that, so the fault injectors reproduce
+// the real shape rather than the convenient one.
+func noRoom(f *os.File, errno syscall.Errno) error {
+	return &fs.PathError{Op: "write", Path: f.Name(), Err: errno}
+}
+
+// outOfRoom is the pair of errnos that mean the log cannot grow: the device is
+// full, or a quota says it is. A network filesystem usually reports the second.
+// Both have to reach the backpressure policy, so the tests run over both.
+var outOfRoom = map[string]syscall.Errno{
+	"ENOSPC": syscall.ENOSPC,
+	"EDQUOT": syscall.EDQUOT,
+}
+
 // enospcAfter returns a write function whose segment writes start failing once
 // the flag is set, leaving the reservation alone.
 func enospcAfter(failing *atomic.Bool) func(*os.File, []byte) (int, error) {
+	return writeFailsAfter(failing, syscall.ENOSPC)
+}
+
+func writeFailsAfter(failing *atomic.Bool, errno syscall.Errno) func(*os.File, []byte) (int, error) {
 	return func(f *os.File, b []byte) (int, error) {
 		if failing.Load() && isSegment(f) {
-			return 0, syscall.ENOSPC
+			return 0, noRoom(f, errno)
 		}
 		return f.Write(b)
 	}
@@ -38,34 +59,42 @@ func enospcAfter(failing *atomic.Bool) func(*os.File, []byte) (int, error) {
 // because a fresh directory claims its first block of LSNs before it can stage
 // anything.
 func enospcReserving(failing *atomic.Bool) func(*os.File, []byte) (int, error) {
+	return writeFailsReserving(failing, syscall.ENOSPC)
+}
+
+func writeFailsReserving(failing *atomic.Bool, errno syscall.Errno) func(*os.File, []byte) (int, error) {
 	return func(f *os.File, b []byte) (int, error) {
 		if failing.Load() && !isSegment(f) {
-			return 0, syscall.ENOSPC
+			return 0, noRoom(f, errno)
 		}
 		return f.Write(b)
 	}
 }
 
 func TestDiskFullRejectSurfacesErrDiskFull(t *testing.T) {
-	var failing atomic.Bool
-	failing.Store(true)
+	for name, errno := range outOfRoom {
+		t.Run(name, func(t *testing.T) {
+			var failing atomic.Bool
+			failing.Store(true)
 
-	b := openBuf(t, t.TempDir(), &recorder{}, fast(
-		WithOnFull(Reject()),
-		withWriteFault(enospcAfter(&failing)),
-	)...)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = b.Close(ctx)
-	}()
+			b := openBuf(t, t.TempDir(), &recorder{}, fast(
+				WithOnFull(Reject()),
+				withWriteFault(writeFailsAfter(&failing, errno)),
+			)...)
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = b.Close(ctx)
+			}()
 
-	err := b.Write(context.Background(), "no room")
-	if !errors.Is(err, ErrDiskFull) {
-		t.Fatalf("Write on a full disk = %v, want ErrDiskFull", err)
-	}
-	if s := b.Stats(); s.DiskFullEvents == 0 {
-		t.Fatal("Stats.DiskFullEvents is 0; a full disk must be visible in metrics")
+			err := b.Write(context.Background(), "no room")
+			if !errors.Is(err, ErrDiskFull) {
+				t.Fatalf("Write with %s = %v, want ErrDiskFull", name, err)
+			}
+			if s := b.Stats(); s.DiskFullEvents == 0 {
+				t.Fatalf("Stats.DiskFullEvents is 0 for %s; a log that cannot grow must be visible in metrics", name)
+			}
+		})
 	}
 }
 
@@ -206,12 +235,65 @@ func TestDiskFullDoesNotCorruptTheLog(t *testing.T) {
 // backpressure policy like any other: returning it raw would skip Reject,
 // DropOldest, Block, the disk-full metric, and the retry once space comes back.
 func TestDiskFullWhileReservingRunsThePolicy(t *testing.T) {
+	for name, errno := range outOfRoom {
+		t.Run(name, func(t *testing.T) {
+			var failing atomic.Bool
+			failing.Store(true) // fails the first reservation, on the first write
+
+			b := openBuf(t, t.TempDir(), &recorder{}, fast(
+				WithOnFull(Reject()),
+				withWriteFault(writeFailsReserving(&failing, errno)),
+			)...)
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = b.Close(ctx)
+			}()
+
+			err := b.Write(context.Background(), "no room to number this")
+			if !errors.Is(err, ErrDiskFull) {
+				t.Fatalf("Write that could not reserve an LSN with %s = %v, want ErrDiskFull", name, err)
+			}
+			if s := b.Stats(); s.DiskFullEvents == 0 {
+				t.Fatalf("Stats.DiskFullEvents is 0 for %s; a reservation that found no room must be visible in metrics", name)
+			}
+
+			// And it is transient: once there is room, the same buffer works.
+			failing.Store(false)
+			if err := b.Write(context.Background(), "room now"); err != nil {
+				t.Fatalf("Write after space came back: %v", err)
+			}
+			fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := b.Flush(fctx); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+		})
+	}
+}
+
+// withRollbackSyncFault fails the fsync a rollback makes after cutting a failed
+// commit back out of the segment. That is the one failure that breaks the log
+// for good, so it has its own hook.
+func withRollbackSyncFault(fn func(*os.File) error) Option {
+	return func(c *config) { c.wal.RollbackSyncFunc = fn }
+}
+
+// TestBrokenLogFailsInsteadOfRetryingForever covers the case where a failed
+// commit could not be rolled back. The log is terminally broken then, but the
+// error it keeps handing out still carries the ENOSPC that broke it — so
+// classifying it as disk-full parks the writer on space that is never coming
+// back. Under Block that is a livelock with nothing to see from the outside.
+func TestBrokenLogFailsInsteadOfRetryingForever(t *testing.T) {
 	var failing atomic.Bool
-	failing.Store(true) // fails the first reservation, on the first write
+	failing.Store(true)
 
 	b := openBuf(t, t.TempDir(), &recorder{}, fast(
-		WithOnFull(Reject()),
-		withWriteFault(enospcReserving(&failing)),
+		WithOnFull(Block()),
+		withWriteFault(enospcAfter(&failing)),
+		// The rollback's fsync fails too, which is what makes the log broken
+		// rather than merely full.
+		withRollbackSyncFault(func(*os.File) error { return syscall.ENOSPC }),
 	)...)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -219,22 +301,16 @@ func TestDiskFullWhileReservingRunsThePolicy(t *testing.T) {
 		_ = b.Close(ctx)
 	}()
 
-	err := b.Write(context.Background(), "no room to number this")
-	if !errors.Is(err, ErrDiskFull) {
-		t.Fatalf("Write that could not reserve an LSN = %v, want ErrDiskFull", err)
-	}
-	if s := b.Stats(); s.DiskFullEvents == 0 {
-		t.Fatal("Stats.DiskFullEvents is 0; a reservation that hit a full disk must be visible in metrics")
-	}
-
-	// And it is transient: once there is room, the same buffer works.
-	failing.Store(false)
-	if err := b.Write(context.Background(), "room now"); err != nil {
-		t.Fatalf("Write after space came back: %v", err)
-	}
-	fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := b.Flush(fctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+	err := b.Write(ctx, "the log cannot take this")
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("Write spun until its deadline; a broken log must fail the buffer, not look like transient disk pressure")
+	}
+	if !errors.Is(err, ErrFailed) {
+		t.Fatalf("Write on a broken log = %v, want ErrFailed", err)
+	}
+	if s := b.Stats(); s.Err == nil {
+		t.Fatal("Stats.Err is nil; a broken log has to be visible to a caller polling stats")
 	}
 }

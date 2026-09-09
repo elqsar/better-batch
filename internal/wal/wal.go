@@ -33,6 +33,15 @@ var (
 	ErrTruncated      = errors.New("wal: records have been truncated away")
 	ErrCorrupt        = errors.New("wal: corrupt record")
 
+	// ErrBroken means a failed commit could not be rolled back, so the segment
+	// may still hold a fragment that later appends would bury beyond recovery's
+	// reach. The log accepts nothing more. Records already durable are
+	// unaffected: the next Open reads the fragment as a torn tail and truncates
+	// it away. The cause stays wrapped, so a caller can still see what started
+	// it — but it must be tested for before that cause is, because a full disk
+	// that breaks the log this way is no longer something waiting will fix.
+	ErrBroken = errors.New("wal: log is broken")
+
 	// ErrPending means the wait was abandoned before the records' commit round
 	// finished. They are still staged and may yet become durable, so the caller
 	// must not treat them as lost.
@@ -91,6 +100,13 @@ type Options struct {
 	// there has to be reachable from a test, because it is the point where a
 	// half-finished rotation would otherwise be left behind. Nil in production.
 	SyncFunc func(*os.File) error
+
+	// RollbackSyncFunc replaces the fsync a rollback makes after cutting the
+	// segment back. It is deliberately not SyncFunc: a rollback that fails is
+	// what makes the log terminally broken, which is a different fault from a
+	// commit or a rotation failing, and a test wants one without the other.
+	// Nil in production.
+	RollbackSyncFunc func(*os.File) error
 }
 
 func (o Options) withDefaults() Options {
@@ -543,9 +559,12 @@ func (l *Log) commit() error {
 		l.nextLSN = first
 		if rollbackErr != nil {
 			// The segment may still hold a fragment that later appends would
-			// bury beyond recovery's reach. This one really is terminal.
+			// bury beyond recovery's reach. This one really is terminal, and it
+			// has to say so: the joined cause still carries the ENOSPC that
+			// started it, and a caller reading only that would treat a dead log
+			// as disk pressure that draining will relieve.
 			l.broken = true
-			l.failErr = errors.Join(err, rollbackErr)
+			l.failErr = fmt.Errorf("%w: %w", ErrBroken, errors.Join(err, rollbackErr))
 		}
 		err = l.failErr
 	} else {
@@ -576,6 +595,11 @@ func (l *Log) rollback() error {
 		return err
 	}
 	// The file is opened O_APPEND, so the next write lands at the new end.
+	// Through its own hook rather than l.sync: failing here is what breaks the
+	// log for good, and a test of a failed rotation must not trip it too.
+	if l.opts.RollbackSyncFunc != nil {
+		return l.opts.RollbackSyncFunc(active.f)
+	}
 	return active.f.Sync()
 }
 

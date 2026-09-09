@@ -57,8 +57,16 @@ var (
 	ErrUncertain = errors.New("batch: write outcome uncertain")
 )
 
-// isDiskFull reports whether an error is the filesystem being out of room.
-func isDiskFull(err error) bool { return errors.Is(err, syscall.ENOSPC) }
+// isDiskFull reports whether an error is the filesystem refusing to grow the
+// log for want of room. ENOSPC is the device itself being full; EDQUOT is a
+// user or group quota, which is what a network filesystem usually reports
+// instead. A caller can do exactly as much about either, and both clear by the
+// same route — the flusher draining and persist truncating a segment away — so
+// treating only one of them as backpressure would skip the policy, the metric
+// and the retry for the other.
+func isDiskFull(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}
 
 // Buffer accepts records at high rates, keeps them durably, and hands them to a
 // sink in batches. It is safe for concurrent use.
@@ -330,6 +338,16 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 		// the very first write to a directory does that. Either way the log has
 		// rolled back to a state where retrying is safe.
 		b.release(n, size)
+		if errors.Is(err, wal.ErrBroken) {
+			// A failed commit whose rollback also failed. The log will never
+			// accept anything again, but the error still carries the ENOSPC
+			// that started it — so this has to be asked before isDiskFull,
+			// which would otherwise park the writer on space that is never
+			// coming back. Records already written stay durable and replay on
+			// the next Open, which truncates the fragment away as a torn tail.
+			b.fail(fmt.Errorf("batch: append: %w", err))
+			return b.failure()
+		}
 		if !isDiskFull(err) {
 			return fmt.Errorf("batch: append: %w", err)
 		}
