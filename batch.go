@@ -78,6 +78,11 @@ type Buffer[T any] struct {
 	codec Codec[T]
 	cfg   config
 
+	// obs delivers Observer callbacks off the goroutine that reached the event.
+	// It is nil unless WithAsyncObserver asked for it, and is set once in Open
+	// and never again, so reading it needs no lock — as with cfg.
+	obs *dispatcher
+
 	acks *ackTracker
 
 	// Accounting for the unflushed backlog, which is what capacity limits and
@@ -220,6 +225,12 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 	if err := b.countBacklog(checkpoint + 1); err != nil {
 		log.Close()
 		return nil, err
+	}
+
+	// Started only once Open cannot fail any more, so no error path has to
+	// remember to stop it.
+	if cfg.observerQueue > 0 {
+		b.obs = newDispatcher(cfg.observerQueue)
 	}
 
 	go b.flusher(checkpoint + 1)

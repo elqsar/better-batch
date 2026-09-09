@@ -362,3 +362,223 @@ func TestPartialObserverIsSafe(t *testing.T) {
 		t.Fatalf("OnWrite saw %d records, want 20", writes.Load())
 	}
 }
+
+// TestStatsIsSafeFromCallbacks pins the one re-entrant call a synchronous
+// callback is allowed to make. Stats touches only atomics and mutexes the
+// callbacks are never invoked under, so every hook may read it; Write, Flush and
+// Close may not, which is what WithAsyncObserver exists for.
+func TestStatsIsSafeFromCallbacks(t *testing.T) {
+	sink := &recorder{}
+	var seen atomic.Int64
+	read := func(b **Buffer[string]) func() {
+		return func() {
+			if *b != nil {
+				_ = (*b).Stats()
+				seen.Add(1)
+			}
+		}
+	}
+	var b *Buffer[string]
+	obs := Observer{
+		OnWrite:        func(int, int) { read(&b)() },
+		OnFlush:        func(FlushInfo) { read(&b)() },
+		OnDrop:         func(int, DropReason) { read(&b)() },
+		OnDeadLetter:   func(int) { read(&b)() },
+		OnBackpressure: func(State, Decision) { read(&b)() },
+		OnCheckpoint:   func(uint64) { read(&b)() },
+	}
+	b = openBuf(t, t.TempDir(), sink, fast(WithObserver(obs))...)
+
+	ctx := context.Background()
+	for i := range 20 {
+		if err := b.Write(ctx, fmt.Sprintf("event-%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatal(err)
+	}
+	closeBuf(t, b)
+
+	if seen.Load() == 0 {
+		t.Fatal("no callback managed to read Stats")
+	}
+}
+
+// TestAsyncObserverSurvivesABlockingHook is the case a synchronous Observer
+// cannot survive: a hook that blocks holds the delivery slot it was called from,
+// and at the default MaxInFlight of 1 that stops the flusher outright.
+func TestAsyncObserverSurvivesABlockingHook(t *testing.T) {
+	sink := &recorder{}
+	release := make(chan struct{})
+	obs := Observer{OnFlush: func(FlushInfo) { <-release }}
+	b := openBuf(t, t.TempDir(), sink, fast(WithAsyncObserver(obs, 64))...)
+
+	ctx := context.Background()
+	for i := range 50 {
+		if err := b.Write(ctx, fmt.Sprintf("event-%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatalf("Flush stalled behind a blocking hook: %v", err)
+	}
+	if got := b.Stats().PendingRecords; got != 0 {
+		t.Fatalf("backlog is %d records; a blocking hook should not hold it up", got)
+	}
+
+	// Close drains the dispatcher under its own context and gives up when that
+	// expires. Everything is durable by then, so a hook still wedged costs a
+	// leaked goroutine and a missed metric, not a failed Close.
+	cctx, ccancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer ccancel()
+	start := time.Now()
+	if err := b.Close(cctx); err != nil {
+		t.Fatalf("Close failed on a hook that was still wedged: %v", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Close waited %v on a wedged hook; the drain is meant to be bounded by ctx", waited)
+	}
+	close(release)
+}
+
+// TestAsyncObserverAllowsReentrantCalls covers the combination that deadlocks
+// outright when the callbacks run inline: a hook calling Write against a full
+// buffer under the default Block policy waits for capacity that only its own
+// return can release.
+func TestAsyncObserverAllowsReentrantCalls(t *testing.T) {
+	sink := &recorder{}
+	var b *Buffer[string]
+	var writes, flushes atomic.Int64
+	// Bounded: a hook that writes on every flush feeds itself another flush, and
+	// left to spin it is a busy loop that perturbs the rest of the suite. Two
+	// passes prove the point the test is making.
+	var entered atomic.Int64
+	obs := Observer{
+		OnFlush: func(FlushInfo) {
+			if entered.Add(1) > 2 {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := b.Write(ctx, "from-hook"); err == nil || errors.Is(err, ErrClosed) {
+				writes.Add(1)
+			}
+			if err := b.Flush(ctx); err == nil || errors.Is(err, ErrClosed) {
+				flushes.Add(1)
+			}
+		},
+	}
+	b = openBuf(t, t.TempDir(), sink, fast(
+		WithAsyncObserver(obs, 64),
+		WithCapacity(3, 0),
+		WithFlush(1, 0, 5*time.Millisecond),
+	)...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := range 3 {
+		if err := b.Write(ctx, fmt.Sprintf("event-%d", i)); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for writes.Load() == 0 || flushes.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("re-entrant hooks never completed: Write=%d Flush=%d", writes.Load(), flushes.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	closeBuf(t, b)
+}
+
+// TestAsyncObserverDropsRatherThanBlocks: a hook that cannot keep up must cost
+// metrics, not throughput or records.
+func TestAsyncObserverDropsRatherThanBlocks(t *testing.T) {
+	sink := &recorder{}
+	obs := Observer{OnFlush: func(FlushInfo) { time.Sleep(20 * time.Millisecond) }}
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithAsyncObserver(obs, 1),
+		WithFlush(1, 0, 2*time.Millisecond),
+	)...)
+
+	ctx := context.Background()
+	for i := range 100 {
+		if err := b.Write(ctx, fmt.Sprintf("event-%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatal(err)
+	}
+	st := b.Stats()
+	if st.Flushed != 100 {
+		t.Fatalf("delivered %d records, want 100: the queue must drop events, not records", st.Flushed)
+	}
+	if st.ObserverDropped == 0 {
+		t.Fatal("a queue of 1 against a 20ms hook dropped nothing; ObserverDropped is not counting")
+	}
+	closeBuf(t, b)
+}
+
+// TestAsyncObserverRecoversAPanickingHook: one bad hook must not take every
+// metric after it down with the dispatcher goroutine.
+func TestAsyncObserverRecoversAPanickingHook(t *testing.T) {
+	sink := &recorder{}
+	var seen atomic.Int64
+	obs := Observer{
+		OnFlush: func(FlushInfo) {
+			if seen.Add(1) == 1 {
+				panic("hook is broken")
+			}
+		},
+	}
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithAsyncObserver(obs, 64),
+		WithFlush(1, 0, 2*time.Millisecond),
+	)...)
+
+	ctx := context.Background()
+	for i := range 10 {
+		if err := b.Write(ctx, fmt.Sprintf("event-%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := b.Flush(fctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for seen.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the dispatcher stopped after the panic: only %d hooks ran", seen.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := b.Stats().ObserverDropped; got != 1 {
+		t.Fatalf("ObserverDropped is %d, want 1: a panicking hook has to be visible", got)
+	}
+	closeBuf(t, b)
+}
+
+// TestObserverOptionsAreLastOneWins: WithObserver after WithAsyncObserver has to
+// put the callbacks back on the caller's goroutine, or the option ordering lies.
+func TestObserverOptionsAreLastOneWins(t *testing.T) {
+	c := newCounters()
+	sink := &recorder{}
+	b := openBuf(t, t.TempDir(), sink, fast(
+		WithAsyncObserver(c.observer(), 64),
+		WithObserver(c.observer()),
+	)...)
+	if b.obs != nil {
+		t.Fatal("WithObserver did not turn the dispatcher back off")
+	}
+	closeBuf(t, b)
+}

@@ -54,6 +54,11 @@ type config struct {
 
 	checkpointInterval time.Duration
 	observer           Observer
+
+	// observerQueue is the depth of the asynchronous observer's queue. Zero
+	// means the callbacks run inline on whichever goroutine reached the event,
+	// which is the default and costs exactly what a direct call costs.
+	observerQueue int
 }
 
 // deadLetterBackoff resolves the ladder the dead-letter sink retries on.
@@ -223,7 +228,9 @@ func WithDeadLetterRetry(b Backoff, maxAttempts int) Option {
 // acknowledged, so a restart with a codec that understands it delivers it.
 //
 // The handler runs on the flusher's goroutine, so blocking in it blocks
-// delivery, and calling back into the Buffer from it will deadlock. Writing the
+// delivery, and calling back into the Buffer from it will deadlock.
+// WithAsyncObserver does not help here: the buffer acts on what this returns,
+// so it has to be answered before the flusher can carry on. Writing the
 // payload somewhere is the point; anything slower is not.
 func WithOnDecodeFailure(f func(DecodeFailure) DecodeAction) Option {
 	return func(c *config) { c.onDecodeFailure = f }
@@ -257,7 +264,8 @@ func WithOnDecodeFailure(f func(DecodeFailure) DecodeAction) Option {
 // It runs on the delivery goroutine, after the sink call it is deciding about,
 // and never for an error caused by Close cancelling delivery — that error is
 // the shutdown talking, not the sink's verdict. Calling back into the Buffer
-// from it will deadlock.
+// from it will deadlock, and WithAsyncObserver does not help: the buffer acts
+// on what this returns, so it has to be answered before the batch can move on.
 func WithOnSinkError(f func(SinkFailure) RetryDecision) Option {
 	return func(c *config) { c.onSinkError = f }
 }
@@ -269,7 +277,36 @@ func WithOnSinkError(f func(SinkFailure) RetryDecision) Option {
 // metrics package. Every field of the Observer is optional. See the package
 // README for worked Prometheus and OpenTelemetry wiring.
 func WithObserver(o Observer) Option {
-	return func(c *config) { c.observer = o }
+	return func(c *config) { c.observer = o; c.observerQueue = 0 }
+}
+
+// defaultObserverQueue is the queue depth WithAsyncObserver falls back to. It is
+// large enough to absorb a burst of flush attempts and drops without being a
+// meaningful amount of memory.
+const defaultObserverQueue = 1024
+
+// WithAsyncObserver attaches an Observer whose callbacks run on a goroutine of
+// the buffer's own, rather than on whichever goroutine reached the event.
+//
+// It buys back the two things a synchronous Observer costs. A hook that blocks
+// can no longer stall the flusher or hold one of the MaxInFlight delivery slots,
+// and a hook may call back into the Buffer — Write, Flush, Close and all — with
+// nothing to deadlock against, because the goroutine whose progress it would
+// have been waiting on has already moved on.
+//
+// The price is that events are dropped rather than queued without bound when a
+// hook cannot keep up, and that a hook which panics is recovered rather than
+// crashing the process. Stats().ObserverDropped counts both, so a hook that is
+// too slow or too fragile shows up as missing metrics instead of as missing
+// throughput. A queue of zero or less gets a reasonable default.
+//
+// It does not apply to Policy.OnFull, WithOnSinkError or WithOnDecodeFailure:
+// the buffer acts on what those return, so they have to stay synchronous.
+func WithAsyncObserver(o Observer, queue int) Option {
+	if queue <= 0 {
+		queue = defaultObserverQueue
+	}
+	return func(c *config) { c.observer = o; c.observerQueue = queue }
 }
 
 // WithCheckpointInterval sets how often the low-water mark is persisted.

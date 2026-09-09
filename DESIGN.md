@@ -458,4 +458,21 @@ weaken the one guarantee the library exists to make. `SyncNever` is the fast mod
 5. ~~Observability.~~ **done** — `Stats` plus `Observer` callbacks. The dependency question
    settled itself: the callbacks carry everything, so Prometheus and OTel wiring lives in
    the README instead of in the module.
+
+   The callbacks run inline by default, on whichever goroutine reached the event and under
+   no lock of the buffer's. That is the cheapest thing that works, but it makes the caller
+   responsible for never blocking and never re-entering the `Buffer` — and the two failure
+   modes are unforgiving: a hook that blocks in a delivery holds a `MaxInFlight` slot and
+   stops the flusher, and `OnFlush` calling `Write` against a full buffer deadlocks outright,
+   since the capacity it waits for is released only after it returns.
+
+   `WithAsyncObserver` is the way out, and it is available *because* no `Observer` hook has a
+   return value: they are pure notifications, so moving them onto a goroutine of the buffer's
+   own changes no semantics. `Policy.OnFull`, `WithOnSinkError` and `WithOnDecodeFailure`
+   cannot follow — the buffer acts on what they return — which is why they keep the
+   synchronous contract and its warnings.
+
+   Overflow drops rather than blocks. A queue that blocks when it is full would reinstate
+   exactly the problem the option exists to solve, so the events go and `Stats().ObserverDropped`
+   counts them: a hook too slow to keep up costs metrics, never throughput or records.
 6. Sinks worth shipping: ClickHouse, Kafka, OTLP, plus `func` adapters. ← next

@@ -332,9 +332,48 @@ primary-sink latency.
 `DropReason` is `ReasonPolicy`, `ReasonDecode`, or `ReasonRetriesExhausted`, and both it and
 `Decision` implement `String()` so they drop straight into a metric label.
 
-> **Callbacks run on the buffer's own goroutines.** Blocking in one blocks the pipeline, and
-> calling back into the `Buffer` from one will deadlock. Keep them to incrementing a counter
-> or observing a histogram.
+### Which goroutine a callback runs on
+
+Not the buffer's own, necessarily — whichever one reached the event, and never holding a lock
+of the buffer's:
+
+| Hook | Runs on |
+| --- | --- |
+| `OnWrite` | the caller's `Write`/`WriteBatch` goroutine (or a background one after `ErrUncertain`) |
+| `OnBackpressure` | the caller's goroutine, inside `Write` |
+| `OnFlush`, `OnDeadLetter` | a delivery goroutine |
+| `OnDrop` | the flusher, a delivery, or the caller — depending on what dropped the records |
+| `OnCheckpoint` | the checkpointer, or whichever goroutine called `Close` |
+
+Two things follow, and both are easy to get wrong.
+
+**Blocking in a callback blocks that goroutine.** From the flusher it stops the pipeline. From
+a delivery it also holds one of the `MaxInFlight` slots, so at the default of 1 it stops the
+flusher too. And it defeats `Close`'s context: `Close` waits for writers and deliveries
+unconditionally, because closing the log while the flusher is still reading it would be worse
+than waiting.
+
+**Calling back into the `Buffer` deadlocks, with one exception.** `Stats()` is safe from any
+callback. `Write`, `Flush` and `Close` are not — a batch's capacity and its place in the
+low-water mark are released only *after* the callback returns, so a hook that waits on either
+is waiting on itself. `OnFlush` calling `Write` against a full buffer is a hard deadlock under
+the default settings.
+
+### Lifting both restrictions
+
+`WithAsyncObserver(o, queue)` runs the callbacks on a goroutine of the buffer's own:
+
+```go
+batch.WithAsyncObserver(observer(), 1024)
+```
+
+A hook may then block, and may call back into the `Buffer` freely. The price is that events
+are dropped rather than queued without bound when a hook cannot keep up, and that a panicking
+hook is recovered rather than crashing the process. `Stats().ObserverDropped` counts both, so
+a hook that is too slow shows up as missing metrics instead of missing throughput.
+
+It does not apply to `Policy.OnFull`, `WithOnSinkError` or `WithOnDecodeFailure`: the buffer
+acts on what those return, so they stay synchronous and the warnings above still hold for them.
 
 ## Prometheus
 
@@ -562,12 +601,16 @@ callback after, or keep a pointer the callback reads lazily.
 If you only want to know that data is being lost:
 
 ```go
-batch.WithObserver(batch.Observer{
+batch.WithAsyncObserver(batch.Observer{
     OnDrop: func(records int, reason batch.DropReason) {
         slog.Warn("buffer dropped records", "count", records, "reason", reason)
     },
-})
+}, 1024)
 ```
+
+`WithAsyncObserver` rather than `WithObserver` because `OnDrop` fires from inside the flusher's
+read loop, and a `slog` handler writing to a slow or full destination blocks. Use `WithObserver`
+here only if you know the handler never does.
 
 ## What to alert on
 
@@ -608,7 +651,8 @@ checkpoint succeeds and the buffer keeps working meanwhile, while `Err` is termi
 | `WithCheckpointInterval(d)` | 200ms | longer means fewer fsyncs, more replay after a crash |
 | `WithSegmentBytes(n)` | 64 MiB | soft cap; segments may overshoot by one commit batch |
 | `WithMaxRecordBytes(n)` | 4 MiB | largest single encoded record; lowering it below stored records fails `Open` |
-| `WithObserver(o)` | none | metrics hooks |
+| `WithObserver(o)` | none | metrics hooks, run inline |
+| `WithAsyncObserver(o, queue)` | none | metrics hooks that may block or re-enter |
 
 ## Codecs
 

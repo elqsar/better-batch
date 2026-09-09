@@ -25,7 +25,10 @@
 // until it stalls the pipeline behind it.
 //
 // The package has no dependencies outside the standard library. Metrics and
-// tracing hook in through [Observer] callbacks and [Buffer.Stats].
+// tracing hook in through [Observer] callbacks and [Buffer.Stats]. The callbacks
+// run inline by default, on whichever goroutine reached the event, so they must
+// not block or call back into the buffer; [WithAsyncObserver] runs them on a
+// goroutine of the buffer's own and lifts both restrictions.
 //
 // This is a library, not a daemon and not a broker: it embeds in the process
 // producing the events, and one buffer directory belongs to one process at a

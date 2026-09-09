@@ -477,10 +477,7 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 			Err:        err,
 		})
 		if err == nil {
-			b.counters.deadLettered.Add(uint64(p.count))
-			if f := b.cfg.observer.OnDeadLetter; f != nil {
-				f(int(p.count))
-			}
+			b.deadLettered(int(p.count))
 			b.completeRange(p)
 			return
 		}
@@ -604,9 +601,7 @@ func (b *Buffer[T]) persist() {
 	// makes the next tick retry a failed truncation instead of skipping it.
 	b.lastCP.Store(low)
 	b.clearRetryable()
-	if f := b.cfg.observer.OnCheckpoint; f != nil {
-		f(low)
-	}
+	b.checkpointed(low)
 	// Truncation is what actually returns space to the filesystem, so it is the
 	// wakeup a writer parked on a full disk is waiting for.
 	b.space.signal()
@@ -689,6 +684,20 @@ func (b *Buffer[T]) Close(ctx context.Context) error {
 		<-b.cpDone
 		b.persist()
 
+		// The dispatcher outlives the final persist, so that last checkpoint is
+		// still reported. This wait is bounded by ctx where the ones above it are
+		// not, and the asymmetry is the point: abandoning a dispatcher goroutine
+		// costs a leaked goroutine and some metrics, while closing the log out
+		// from under the flusher would cost records. A hook wedged here does not
+		// fail the Close either — everything is already durable by now.
+		if b.obs != nil {
+			b.obs.stop()
+			select {
+			case <-b.obs.done:
+			case <-ctx.Done():
+			}
+		}
+
 		err := b.log.Close()
 		if err == nil && timedOut {
 			err = ctx.Err()
@@ -718,6 +727,12 @@ type Stats struct {
 
 	DiskFullEvents uint64 // writes that found the log unable to grow
 
+	// ObserverDropped counts events the asynchronous observer's queue could not
+	// accept, plus any callback that panicked. It is always zero without
+	// WithAsyncObserver. Anything above zero means the metrics are incomplete,
+	// not that records were lost.
+	ObserverDropped uint64
+
 	Checkpoint   uint64 // last persisted low-water mark
 	DurableLSN   uint64 // highest LSN in the log
 	SinkFailures int64  // consecutive failed flushes
@@ -736,21 +751,31 @@ type Stats struct {
 func (b *Buffer[T]) Stats() Stats {
 	age := b.ages.oldest(time.Now().UnixNano())
 	return Stats{
-		Written:        b.counters.written.Load(),
-		Flushed:        b.counters.flushed.Load(),
-		Dropped:        b.counters.dropped.Load(),
-		DeadLettered:   b.counters.deadLettered.Load(),
-		Retries:        b.counters.retries.Load(),
-		DiskFullEvents: b.counters.diskFull.Load(),
-		PendingRecords: b.pendingRecords.Load(),
-		PendingBytes:   b.pendingBytes.Load(),
-		OldestAge:      age,
-		Checkpoint:     b.lastCP.Load(),
-		DurableLSN:     b.log.DurableLSN(),
-		SinkFailures:   b.sinkFailures.Load(),
-		Err:            b.err(),
-		CheckpointErr:  b.retryableErr(),
+		Written:         b.counters.written.Load(),
+		Flushed:         b.counters.flushed.Load(),
+		Dropped:         b.counters.dropped.Load(),
+		DeadLettered:    b.counters.deadLettered.Load(),
+		Retries:         b.counters.retries.Load(),
+		DiskFullEvents:  b.counters.diskFull.Load(),
+		ObserverDropped: b.observerDropped(),
+		PendingRecords:  b.pendingRecords.Load(),
+		PendingBytes:    b.pendingBytes.Load(),
+		OldestAge:       age,
+		Checkpoint:      b.lastCP.Load(),
+		DurableLSN:      b.log.DurableLSN(),
+		SinkFailures:    b.sinkFailures.Load(),
+		Err:             b.err(),
+		CheckpointErr:   b.retryableErr(),
 	}
+}
+
+// observerDropped reports what the asynchronous observer could not deliver,
+// zero when the callbacks run inline.
+func (b *Buffer[T]) observerDropped() uint64 {
+	if b.obs == nil {
+		return 0
+	}
+	return b.obs.dropped.Load()
 }
 
 // noteRetryable records a failure that the next checkpoint tick will retry.
