@@ -137,3 +137,64 @@ func TestPanicInInlineObserverIsCountedNotFatal(t *testing.T) {
 		t.Fatalf("ObserverDropped = %d, want every panicking hook counted", s.ObserverDropped)
 	}
 }
+
+// panicCodec is a codec with a bug: it panics on one payload instead of
+// returning an error.
+type panicCodec struct{}
+
+func (panicCodec) Encode(dst []byte, v string) ([]byte, error) { return append(dst, v...), nil }
+func (panicCodec) Decode(src []byte) (string, error) {
+	if string(src) == "poison" {
+		panic("codec bug")
+	}
+	return string(src), nil
+}
+
+// Decode runs on the flusher's goroutine, so a codec that panics would end the
+// process. A panic on one payload is that payload failing to decode, and it has
+// to take the same route: dropped by default, kept by StopBuffer.
+func TestPanicInCodecIsADecodeFailure(t *testing.T) {
+	t.Run("dropped by default", func(t *testing.T) {
+		sink := &recorder{}
+		b, err := Open[string](t.TempDir(), sink, panicCodec{}, fast()...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeBuf(t, b)
+		if err := b.WriteBatch(context.Background(), "a", "poison", "b"); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := sink.seen(); !slices.Equal(got, []string{"a", "b"}) {
+			t.Fatalf("sink saw %q, want the records around the one the codec panicked on", got)
+		}
+		if s := b.Stats(); s.Dropped != 1 || s.Err != nil {
+			t.Fatalf("Dropped = %d, Err = %v; want 1 and nil", s.Dropped, s.Err)
+		}
+	})
+
+	t.Run("kept by StopBuffer", func(t *testing.T) {
+		var cause error
+		b, err := Open[string](t.TempDir(), &recorder{}, panicCodec{}, fast(
+			WithOnDecodeFailure(func(f DecodeFailure) DecodeAction {
+				cause = f.Err
+				return StopBuffer
+			}),
+		)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Write(context.Background(), "poison"); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, 5*time.Second, func() bool { return b.Stats().Err != nil })
+		if !errors.Is(cause, ErrPanic) || !errors.Is(b.Stats().Err, ErrPanic) {
+			t.Fatalf("handler saw %v and Stats().Err is %v; want both to match ErrPanic", cause, b.Stats().Err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	})
+}

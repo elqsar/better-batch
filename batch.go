@@ -57,8 +57,8 @@ var (
 	ErrUncertain = errors.New("batch: write outcome uncertain")
 
 	// ErrPanic marks a panic the buffer recovered from code it was calling: a
-	// Sink, a WithOnSinkError or WithOnDecodeFailure handler, or an Observer
-	// hook. Those run on the buffer's own goroutines, where a panic would take
+	// Sink, a Codec's Decode, a WithOnSinkError or WithOnDecodeFailure handler,
+	// or an Observer hook. Those run on the buffer's own goroutines, where a panic would take
 	// the whole process down and the caller has no frame to recover it in.
 	//
 	// A panicking sink or handler fails the buffer, as FailBuffer does: nothing
@@ -66,7 +66,9 @@ var (
 	// The error wraps ErrPanic and carries the panic value and stack, so
 	// Stats().Err says where it happened. A panicking Observer hook is counted
 	// in Stats().ObserverDropped instead, because losing a metric is not a
-	// reason to stop the pipeline.
+	// reason to stop the pipeline. A Decode that panics is a record that did
+	// not decode: its DecodeFailure.Err matches ErrPanic, and it is dropped or
+	// kept as WithOnDecodeFailure decides.
 	ErrPanic = errors.New("batch: panicked")
 
 	// ErrInvalidOption means Open was given an option no reading can make

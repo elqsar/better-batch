@@ -118,7 +118,7 @@ func (b *Buffer[T]) flusher(from uint64) {
 			if lsn < b.floor.Load() {
 				b.dropped(1, ReasonPolicy)
 				skip = true
-			} else if decoded, derr := b.codec.Decode(payload); derr != nil {
+			} else if decoded, derr := b.decode(payload); derr != nil {
 				// A record that will not decode can never be delivered by this
 				// codec. Dropping it keeps the pipeline moving; the handler can
 				// ask to stop instead and keep it for a codec that understands
@@ -557,6 +557,19 @@ func (b *Buffer[T]) sinkPanicked(batch Batch[T], p pending[T], attempt int, dead
 		which = "dead-letter sink"
 	}
 	b.fail(fmt.Errorf("batch: %s on batch %d: %w", which, batch.ID, perr))
+}
+
+// decode runs the codec on the flusher's goroutine, where a panic has no frame
+// of the caller's to be recovered in. A codec that panics on a payload is a
+// codec that could not decode it, so the panic becomes the decode error and the
+// record goes where any undecodable record goes: WithOnDecodeFailure decides,
+// and StopBuffer keeps it for a codec that is fixed.
+func (b *Buffer[T]) decode(payload []byte) (v T, err error) {
+	if perr := protect(func() { v, err = b.codec.Decode(payload) }); perr != nil {
+		var zero T
+		return zero, fmt.Errorf("codec: %w", perr)
+	}
+	return v, err
 }
 
 // decodeFailure asks the configured handler what to do about a record the codec
