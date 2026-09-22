@@ -659,6 +659,34 @@ func TestWriteAfterCloseIsRejected(t *testing.T) {
 	}
 }
 
+// A writer that had already given up before calling must not have its record
+// land anyway. ErrUncertain is for a deadline that passes mid-commit; before
+// anything is staged there is nothing uncertain about it.
+func TestWriteWithCancelledContextWritesNothing(t *testing.T) {
+	sink := &recorder{}
+	b := openBuf(t, t.TempDir(), sink, fast()...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := range 50 {
+		err := b.Write(ctx, fmt.Sprintf("abandoned%d", i))
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrUncertain) {
+			t.Fatalf("Write with a cancelled ctx = %v, want context.Canceled and not ErrUncertain", err)
+		}
+	}
+
+	if err := b.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sink.seen(); len(got) != 0 {
+		t.Fatalf("sink saw %v from writes whose context was already cancelled", got)
+	}
+	if s := b.Stats(); s.Written != 0 || s.PendingRecords != 0 {
+		t.Fatalf("Stats.Written = %d, PendingRecords = %d; want 0 and 0", s.Written, s.PendingRecords)
+	}
+}
+
 // A record whose writer stopped waiting is still staged and still commits. The
 // buffer has to finish the accounting the writer walked away from: releasing its
 // reservation here would let the flusher release it a second time on delivery

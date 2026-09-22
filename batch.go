@@ -286,11 +286,13 @@ func (b *Buffer[T]) Write(ctx context.Context, v T) error {
 // A batch larger than the whole configured capacity fails immediately with
 // ErrTooLarge, whatever the policy: no amount of draining could admit it.
 //
-// If ctx expires after the records have been staged but before their commit
-// round finishes, WriteBatch returns ErrUncertain wrapping the context error:
-// the records may still be committed and delivered. The buffer settles its own
-// accounting either way, so the caller's only decision is whether to retry and
-// accept a possible duplicate.
+// A ctx that is already done when WriteBatch is called fails it with the
+// context's own error, and nothing is written. If ctx expires later — after the
+// records have been staged but before their commit round finishes — WriteBatch
+// returns ErrUncertain wrapping the context error: the records may still be
+// committed and delivered. The buffer settles its own accounting either way, so
+// the caller's only decision is whether to retry and accept a possible
+// duplicate.
 func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 	if len(vs) == 0 {
 		return nil
@@ -299,6 +301,14 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 		return err
 	}
 	defer b.writers.Done()
+
+	// Asked before anything is reserved or staged. Past this point the records
+	// can land even though the caller has given up, which is ErrUncertain's
+	// business; a caller who had already given up must not get that answer,
+	// or a write it abandoned before making it.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	var enc []byte
 	ends := make([]int, len(vs))

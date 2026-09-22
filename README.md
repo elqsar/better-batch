@@ -155,6 +155,9 @@ case err != nil:
 }
 ```
 
+A `ctx` that is already done when `Write` is called is a different case: nothing has been
+staged, so `Write` returns the context's own error and writes nothing.
+
 The wrapped context error is preserved, so `errors.Is(err, context.DeadlineExceeded)` still
 works. The buffer settles its own accounting in the background either way — the backlog
 figures in `Stats()` stay exact whichever way the commit round goes.
