@@ -1,10 +1,25 @@
 package batch
 
 import (
+	"fmt"
 	"math/rand"
+	"runtime/debug"
 	"sync"
 	"time"
 )
+
+// protect runs f and turns a panic in it into an error matching ErrPanic. The
+// stack is taken inside the deferred call, while the panicking frames are still
+// on it, because the panic value alone rarely says where the bug is.
+func protect(f func()) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = fmt.Errorf("%w: %v\n%s", ErrPanic, v, debug.Stack())
+		}
+	}()
+	f()
+	return nil
+}
 
 // gate is a broadcast that late waiters cannot miss: take the channel first,
 // then check the condition, then wait. A signal between the check and the wait

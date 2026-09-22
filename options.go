@@ -295,10 +295,10 @@ const defaultObserverQueue = 1024
 // have been waiting on has already moved on.
 //
 // The price is that events are dropped rather than queued without bound when a
-// hook cannot keep up, and that a hook which panics is recovered rather than
-// crashing the process. Stats().ObserverDropped counts both, so a hook that is
-// too slow or too fragile shows up as missing metrics instead of as missing
-// throughput. A queue of zero or less gets a reasonable default.
+// hook cannot keep up. Stats().ObserverDropped counts them, alongside any hook
+// that panicked, so a hook that is too slow or too fragile shows up as missing
+// metrics instead of as missing throughput. A queue of zero or less gets a
+// reasonable default.
 //
 // It does not apply to Policy.OnFull, WithOnSinkError or WithOnDecodeFailure:
 // the buffer acts on what those return, so they have to stay synchronous.

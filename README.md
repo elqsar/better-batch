@@ -371,9 +371,10 @@ batch.WithAsyncObserver(observer(), 1024)
 ```
 
 A hook may then block, and may call back into the `Buffer` freely. The price is that events
-are dropped rather than queued without bound when a hook cannot keep up, and that a panicking
-hook is recovered rather than crashing the process. `Stats().ObserverDropped` counts both, so
-a hook that is too slow shows up as missing metrics instead of missing throughput.
+are dropped rather than queued without bound when a hook cannot keep up.
+`Stats().ObserverDropped` counts them, so a hook that is too slow shows up as missing metrics
+instead of missing throughput. It also counts hooks that panicked, inline or not: a panicking
+hook is recovered rather than crashing the process.
 
 It does not apply to `Policy.OnFull`, `WithOnSinkError` or `WithOnDecodeFailure`: the buffer
 acts on what those return, so they stay synchronous and the warnings above still hold for them.

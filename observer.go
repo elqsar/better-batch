@@ -92,6 +92,10 @@ type FlushInfo struct {
 // in the low-water mark are only released after the callback returns, so a hook
 // that waits on either waits on itself.
 //
+// A hook that panics is recovered and counted in Stats().ObserverDropped, inline
+// or not: most hooks run on the buffer's own goroutines, where a panic would
+// otherwise end the process.
+//
 // WithAsyncObserver lifts both restrictions by running the callbacks on a
 // goroutine of the buffer's own. Without it, keep them to incrementing a counter
 // or observing a histogram.
@@ -162,8 +166,7 @@ func (d *dispatcher) run() {
 
 // call recovers, because one panicking hook must not silently take every metric
 // after it down with the goroutine. The count lands in Stats().ObserverDropped,
-// so it shows up rather than being swallowed. Synchronous callbacks are left
-// alone: there the panic reaches the caller's own stack, where it belongs.
+// so it shows up rather than being swallowed.
 func (d *dispatcher) call(f func()) {
 	defer func() {
 		if recover() != nil {
@@ -174,6 +177,18 @@ func (d *dispatcher) call(f func()) {
 }
 
 func (d *dispatcher) stop() { close(d.ch) }
+
+// recoverObserver is deferred around a synchronous hook. Most of them run on the
+// buffer's own goroutines — the flusher, a delivery, the checkpointer — where a
+// panic would end the process and the caller has no frame to recover it in, and
+// a metric is not worth the pipeline. Like the dispatcher, it counts the panic
+// in Stats().ObserverDropped rather than swallowing it. It has to call recover
+// itself: recover only works in the deferred function.
+func (b *Buffer[T]) recoverObserver() {
+	if recover() != nil {
+		b.observerPanics.Add(1)
+	}
+}
 
 // emit helpers keep the counter and the callback in one place, so a new drop
 // site cannot update one and forget the other.
@@ -189,6 +204,7 @@ func (b *Buffer[T]) dropped(records int, reason DropReason) {
 		return
 	}
 	if b.obs == nil {
+		defer b.recoverObserver()
 		f(records, reason)
 		return
 	}
@@ -202,6 +218,7 @@ func (b *Buffer[T]) wrote(records, bytes int) {
 		return
 	}
 	if b.obs == nil {
+		defer b.recoverObserver()
 		f(records, bytes)
 		return
 	}
@@ -214,6 +231,7 @@ func (b *Buffer[T]) observeFlush(info FlushInfo) {
 		return
 	}
 	if b.obs == nil {
+		defer b.recoverObserver()
 		f(info)
 		return
 	}
@@ -226,6 +244,7 @@ func (b *Buffer[T]) observeBackpressure(s State, d Decision) {
 		return
 	}
 	if b.obs == nil {
+		defer b.recoverObserver()
 		f(s, d)
 		return
 	}
@@ -239,6 +258,7 @@ func (b *Buffer[T]) deadLettered(records int) {
 		return
 	}
 	if b.obs == nil {
+		defer b.recoverObserver()
 		f(records)
 		return
 	}
@@ -251,6 +271,7 @@ func (b *Buffer[T]) checkpointed(lsn uint64) {
 		return
 	}
 	if b.obs == nil {
+		defer b.recoverObserver()
 		f(lsn)
 		return
 	}

@@ -55,6 +55,19 @@ var (
 	// them either way. Retrying produces a duplicate, which at-least-once
 	// delivery already allows.
 	ErrUncertain = errors.New("batch: write outcome uncertain")
+
+	// ErrPanic marks a panic the buffer recovered from code it was calling: a
+	// Sink, a WithOnSinkError or WithOnDecodeFailure handler, or an Observer
+	// hook. Those run on the buffer's own goroutines, where a panic would take
+	// the whole process down and the caller has no frame to recover it in.
+	//
+	// A panicking sink or handler fails the buffer, as FailBuffer does: nothing
+	// is disposed of, and every record still pending replays on the next Open.
+	// The error wraps ErrPanic and carries the panic value and stack, so
+	// Stats().Err says where it happened. A panicking Observer hook is counted
+	// in Stats().ObserverDropped instead, because losing a metric is not a
+	// reason to stop the pipeline.
+	ErrPanic = errors.New("batch: panicked")
 )
 
 // isDiskFull reports whether an error is the filesystem refusing to grow the
@@ -91,6 +104,10 @@ type Buffer[T any] struct {
 	pendingBytes   atomic.Int64
 	ages           ageTracker // age of the oldest unflushed record
 	sinkFailures   atomic.Int64
+
+	// observerPanics counts synchronous Observer hooks that panicked. The
+	// asynchronous dispatcher keeps its own count alongside what it drops.
+	observerPanics atomic.Uint64
 
 	// failingBatches counts deliveries that have failed at least once and have
 	// not yet resolved. With MaxInFlight above 1 a healthy batch's success must
