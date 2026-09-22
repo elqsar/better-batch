@@ -94,6 +94,13 @@ type State struct {
 }
 
 // Policy decides what happens to a write that does not fit.
+//
+// OnFull runs on the writer's goroutine. Its ctx is the write's own, and it is
+// also cancelled when Close begins, so a policy that waits should wait on it:
+// Close waits for every writer, and a policy that ignores ctx holds the shutdown
+// for as long as it takes, whatever deadline Close was given. A write whose
+// policy returns after Close has begun fails with ErrClosed, whatever the
+// policy decided.
 type Policy interface {
 	OnFull(ctx context.Context, s State) Decision
 }

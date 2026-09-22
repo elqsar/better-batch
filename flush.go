@@ -652,8 +652,9 @@ func (b *Buffer[T]) Close(ctx context.Context) error {
 		b.sealed = true
 		b.mu.Unlock()
 
-		close(b.closing) // release writers parked on the capacity gate
-		b.writers.Wait() // let already-accepted writes finish appending
+		close(b.closing)  // release writers parked on the capacity gate
+		b.closingCancel() // and any parked inside a Policy
+		b.writers.Wait()  // let already-accepted writes finish appending
 		close(b.drainNow)
 
 		timedOut := false

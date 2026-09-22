@@ -358,6 +358,48 @@ func TestRejectPolicyReturnsErrFull(t *testing.T) {
 	}
 }
 
+// A policy that waits on its ctx is a reasonable thing to write, and Close waits
+// for every writer. The ctx a policy is handed has to end when Close begins, or
+// such a policy holds the shutdown past the deadline Close was given.
+func TestCloseReleasesAWriterInsideThePolicy(t *testing.T) {
+	sink := &recorder{}
+	sink.delay.Store(int64(time.Hour)) // holds the one slot until Close cancels it
+	entered := make(chan struct{}, 1)
+	policy := PolicyFunc(func(ctx context.Context, _ State) Decision {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return DecisionReject
+	})
+	b := openBuf(t, t.TempDir(), sink, fast(WithCapacity(1, 0), WithOnFull(policy))...)
+
+	if err := b.Write(context.Background(), "fills"); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := make(chan error, 1)
+	go func() { writeErr <- b.Write(context.Background(), "parked") }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second write never reached the policy")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closed := make(chan struct{})
+	go func() { _ = b.Close(ctx); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close is still waiting on a writer parked inside the policy, past its own 1s deadline")
+	}
+	if err := <-writeErr; !errors.Is(err, ErrClosed) {
+		t.Fatalf("parked Write = %v, want ErrClosed", err)
+	}
+}
+
 func TestBlockPolicyWaitsForCapacity(t *testing.T) {
 	sink := &recorder{}
 	sink.failAll.Store(true)
