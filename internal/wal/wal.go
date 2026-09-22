@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,6 +34,12 @@ const (
 	dirMode  = 0o700
 	fileMode = 0o600
 )
+
+// MaxRecordLimit is the largest MaxRecordBytes the record format can carry: the
+// length field is 32 bits and also has to fit the header, which the recovery
+// scan adds to it. A larger payload would be framed with a length that wrapped,
+// and the log would refuse to open again.
+const MaxRecordLimit = math.MaxUint32 - headerSize
 
 // Errors returned by the log and its readers.
 var (
@@ -182,6 +189,10 @@ type Log struct {
 // implicit LSN numbering cannot be reconstructed across a hole.
 func Open(dir string, opts Options) (*Log, error) {
 	opts = opts.withDefaults()
+	if int64(opts.MaxRecordBytes) > MaxRecordLimit {
+		return nil, fmt.Errorf("wal: MaxRecordBytes %d exceeds the %d a record header can describe",
+			opts.MaxRecordBytes, int64(MaxRecordLimit))
+	}
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}

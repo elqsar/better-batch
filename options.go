@@ -1,6 +1,8 @@
 package batch
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/elqsar/better-batch/internal/wal"
@@ -27,7 +29,8 @@ const (
 )
 
 type config struct {
-	wal wal.Options
+	wal      wal.Options
+	syncMode SyncMode // mapped into wal.SyncMode once validated
 
 	maxRecords int64
 	maxBytes   int64
@@ -92,23 +95,70 @@ type Option func(*config)
 // bounds how long a write waits to be committed with others; it defaults to 5ms.
 func WithSync(mode SyncMode, interval time.Duration) Option {
 	return func(c *config) {
-		c.wal.SyncMode = walSyncMode(mode)
+		c.syncMode = mode
 		c.wal.SyncInterval = interval
 	}
 }
 
 // walSyncMode maps the public mode explicitly rather than converting the
 // integer, so reordering either set of constants cannot silently change what a
-// caller asked for.
-func walSyncMode(m SyncMode) wal.SyncMode {
+// caller asked for. A mode it does not know is reported rather than read as the
+// default: a caller who asked for something else would get weaker durability
+// than they believe they have, or slower writes, and no sign of either.
+func walSyncMode(m SyncMode) (wal.SyncMode, bool) {
 	switch m {
+	case SyncPeriodic:
+		return wal.SyncPeriodic, true
 	case SyncAlways:
-		return wal.SyncAlways
+		return wal.SyncAlways, true
 	case SyncNever:
-		return wal.SyncNever
+		return wal.SyncNever, true
 	default:
-		return wal.SyncPeriodic
+		return 0, false
 	}
+}
+
+// validate reports every option that cannot mean what the caller asked for. An
+// option that quietly fell back to its default instead would hide a typo or a
+// sign error until the buffer behaved differently under load, which is the
+// worst time to find out. Zero keeps its documented meaning — the default, or
+// unlimited — so only values no reading can make sense of are refused.
+func (c *config) validate() error {
+	var errs []error
+	bad := func(option, format string, args ...any) {
+		errs = append(errs, fmt.Errorf("%w: %s: %s", ErrInvalidOption, option, fmt.Sprintf(format, args...)))
+	}
+	if _, ok := walSyncMode(c.syncMode); !ok {
+		bad("WithSync", "unknown SyncMode %d", c.syncMode)
+	}
+	if c.wal.SyncInterval < 0 {
+		bad("WithSync", "negative interval %v", c.wal.SyncInterval)
+	}
+	if c.wal.MaxSegmentBytes < 0 {
+		bad("WithSegmentBytes", "negative size %d", c.wal.MaxSegmentBytes)
+	}
+	if n := c.wal.MaxRecordBytes; n < 0 || int64(n) > wal.MaxRecordLimit {
+		bad("WithMaxRecordBytes", "%d is outside 0..%d, the most a record header can describe", n, int64(wal.MaxRecordLimit))
+	}
+	if c.maxRecords < 0 || c.maxBytes < 0 {
+		bad("WithCapacity", "negative limit (%d records, %d bytes)", c.maxRecords, c.maxBytes)
+	}
+	if c.flushRecords < 0 || c.flushBytes < 0 || c.flushInterval < 0 {
+		bad("WithFlush", "negative trigger (%d records, %d bytes, %v)", c.flushRecords, c.flushBytes, c.flushInterval)
+	}
+	if c.maxInFlight < 0 {
+		bad("WithMaxInFlight", "negative count %d", c.maxInFlight)
+	}
+	if c.maxAttempts < 0 {
+		bad("WithRetry", "negative maxAttempts %d", c.maxAttempts)
+	}
+	if c.dlqAttempts < 0 {
+		bad("WithDeadLetterRetry", "negative maxAttempts %d", c.dlqAttempts)
+	}
+	if c.checkpointInterval < 0 {
+		bad("WithCheckpointInterval", "negative interval %v", c.checkpointInterval)
+	}
+	return errors.Join(errs...)
 }
 
 // WithSegmentBytes sets the soft cap on log segment size. Rotation happens
@@ -148,13 +198,13 @@ func WithCapacity(maxRecords int64, maxBytes int64) Option {
 // passed with anything buffered. Zero leaves a trigger at its default.
 func WithFlush(maxRecords, maxBytes int, maxInterval time.Duration) Option {
 	return func(c *config) {
-		if maxRecords > 0 {
+		if maxRecords != 0 {
 			c.flushRecords = maxRecords
 		}
-		if maxBytes > 0 {
+		if maxBytes != 0 {
 			c.flushBytes = maxBytes
 		}
-		if maxInterval > 0 {
+		if maxInterval != 0 {
 			c.flushInterval = maxInterval
 		}
 	}
@@ -165,7 +215,7 @@ func WithFlush(maxRecords, maxBytes int, maxInterval time.Duration) Option {
 // the sink must be safe for concurrent use.
 func WithMaxInFlight(n int) Option {
 	return func(c *config) {
-		if n > 0 {
+		if n != 0 {
 			c.maxInFlight = n
 		}
 	}
@@ -316,7 +366,7 @@ func WithAsyncObserver(o Observer, queue int) Option {
 // after a crash for fewer fsyncs during normal running.
 func WithCheckpointInterval(d time.Duration) Option {
 	return func(c *config) {
-		if d > 0 {
+		if d != 0 {
 			c.checkpointInterval = d
 		}
 	}

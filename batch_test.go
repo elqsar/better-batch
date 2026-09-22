@@ -2225,3 +2225,46 @@ func TestObserverReportsRetryAction(t *testing.T) {
 		t.Fatalf("RetryAction.String() = %q, want a usable metric label", DeadLetterBatch.String())
 	}
 }
+
+// An option that cannot mean what was asked for used to fall back to its
+// default without a word. Open now refuses it, before it touches the directory.
+func TestOpenRejectsInvalidOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  Option
+	}{
+		{"unknown sync mode", WithSync(SyncMode(99), 0)},
+		{"negative sync interval", WithSync(SyncPeriodic, -time.Millisecond)},
+		{"negative segment size", WithSegmentBytes(-1)},
+		{"negative record size", WithMaxRecordBytes(-1)},
+		{"record size past the header", WithMaxRecordBytes(1 << 32)},
+		{"negative record capacity", WithCapacity(-1, 0)},
+		{"negative byte capacity", WithCapacity(0, -1)},
+		{"negative flush records", WithFlush(-1, 0, 0)},
+		{"negative flush interval", WithFlush(0, 0, -time.Second)},
+		{"negative in-flight", WithMaxInFlight(-1)},
+		{"negative attempts", WithRetry(Backoff{}, -1)},
+		{"negative dead-letter attempts", WithDeadLetterRetry(Backoff{}, -1)},
+		{"negative checkpoint interval", WithCheckpointInterval(-time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "buf")
+			b, err := Open[string](dir, &recorder{}, stringCodec{}, tc.opt)
+			if err == nil {
+				b.Close(context.Background())
+				t.Fatal("Open accepted it")
+			}
+			if !errors.Is(err, ErrInvalidOption) {
+				t.Fatalf("Open = %v, want ErrInvalidOption", err)
+			}
+			if _, serr := os.Stat(dir); !os.IsNotExist(serr) {
+				t.Fatalf("Open created %s before rejecting the option", dir)
+			}
+		})
+	}
+
+	// Zero keeps its documented meaning everywhere.
+	b := openBuf(t, t.TempDir(), &recorder{}, WithFlush(0, 0, 0), WithMaxInFlight(0),
+		WithCheckpointInterval(0), WithCapacity(0, 0), WithSync(SyncNever, 0), WithMaxRecordBytes(0))
+	closeBuf(t, b)
+}

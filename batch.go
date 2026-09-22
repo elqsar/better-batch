@@ -68,6 +68,12 @@ var (
 	// in Stats().ObserverDropped instead, because losing a metric is not a
 	// reason to stop the pipeline.
 	ErrPanic = errors.New("batch: panicked")
+
+	// ErrInvalidOption means Open was given an option no reading can make
+	// sense of: a negative limit, an unknown SyncMode, a record size the log's
+	// header cannot describe. Open reports every such option at once, before
+	// it touches the directory.
+	ErrInvalidOption = errors.New("batch: invalid option")
 )
 
 // isDiskFull reports whether an error is the filesystem refusing to grow the
@@ -178,6 +184,10 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	cfg.wal.SyncMode, _ = walSyncMode(cfg.syncMode)
 
 	var dlq Sink[T]
 	if cfg.deadLetter != nil {
