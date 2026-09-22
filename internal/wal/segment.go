@@ -130,6 +130,9 @@ func (s *segment) discard() {
 // and silently truncating there would discard durable records the writer was
 // told were safe, so it is reported as ErrCorrupt instead.
 //
+// On ErrCorrupt, count and good still describe the intact records in front of
+// the damage, which is what salvaging the segment needs to know.
+//
 // A record longer than maxRecordBytes whose checksum verifies is neither: it is
 // a record written while the limit was larger. Lowering MaxRecordBytes must not
 // quietly delete it, so that is ErrRecordTooLarge rather than a truncation.
@@ -198,7 +201,7 @@ func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, tru
 		}
 		if checksum(length, payload) != crc {
 			if end := good + recordSize(int(length)); end < total {
-				return 0, 0, false, fmt.Errorf("%w: %s: record at offset %d fails its checksum with %d intact bytes after it",
+				return count, good, false, fmt.Errorf("%w: %s: record at offset %d fails its checksum with %d intact bytes after it",
 					ErrCorrupt, path, good, total-end)
 			}
 			return count, good, true, nil

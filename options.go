@@ -359,6 +359,59 @@ func WithAsyncObserver(o Observer, queue int) Option {
 	return func(c *config) { c.observer = o; c.observerQueue = queue }
 }
 
+// Salvage describes damage that WithSalvage cut out of the log while opening it.
+type Salvage struct {
+	// Path is the damaged segment file. It now ends at Offset.
+	Path string
+
+	// Offset is where the first bad record started. Every record before it was
+	// intact and is kept.
+	Offset int64
+
+	// DiscardedBytes is how much was cut, from Offset to the end of the
+	// segment. The records in it cannot be counted: the damage is what would
+	// have said where each one ends.
+	DiscardedBytes int64
+
+	// Kept is the file the discarded bytes were copied to, beside the segment.
+	// The buffer never reads or deletes it; it is there for forensics, or for
+	// recovering records by hand.
+	Kept string
+
+	// Cause describes the damage recovery found.
+	Cause error
+}
+
+// WithSalvage makes Open cut damage out of the log instead of refusing to open
+// it.
+//
+// By default Open fails on a bad record that is not a torn tail — a checksum
+// failure with intact records after it, or a segment cut short that is not the
+// last one — because truncating there discards records the writer was told were
+// durable, and the only way forward is an operator's decision. WithSalvage is
+// that decision made in advance: the damaged segment is cut back to its last
+// good record, the bytes from there on are copied to a .corrupt file beside it,
+// and the sequence numbers of the records lost with them become a gap that is
+// never reused. Every segment after the damage is kept and delivered.
+//
+// What is lost is the rest of the damaged segment, up to WithSegmentBytes of
+// records, which are gone from the pipeline without being counted as dropped:
+// nothing can say how many there were. f is called once per damaged segment,
+// before Open returns, and may be nil. Reach for this on a buffer that must come
+// back unattended, and alert on f; leave it off where a person should look first.
+//
+// A record above WithMaxRecordBytes whose checksum verifies is not damage — it
+// was written under a larger limit — and still fails Open.
+func WithSalvage(f func(Salvage)) Option {
+	return func(c *config) {
+		c.wal.Salvage = func(s wal.Salvage) {
+			if f != nil {
+				f(Salvage{Path: s.Path, Offset: s.Offset, DiscardedBytes: s.DiscardedBytes, Kept: s.Kept, Cause: s.Cause})
+			}
+		}
+	}
+}
+
 // WithCheckpointInterval sets how often the low-water mark is persisted.
 //
 // The checkpoint is an optimisation, not a correctness requirement: a crash

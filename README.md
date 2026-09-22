@@ -655,6 +655,7 @@ checkpoint succeeds and the buffer keeps working meanwhile, while `Err` is termi
 | `WithCheckpointInterval(d)` | 200ms | longer means fewer fsyncs, more replay after a crash |
 | `WithSegmentBytes(n)` | 64 MiB | soft cap; segments may overshoot by one commit batch |
 | `WithMaxRecordBytes(n)` | 4 MiB | largest single encoded record; lowering it below stored records fails `Open` |
+| `WithSalvage(f)` | off | cut interior corruption out on `Open` instead of failing; `f` reports each cut |
 | `WithObserver(o)` | none | metrics hooks, run inline |
 | `WithAsyncObserver(o, queue)` | none | metrics hooks that may block or re-enter |
 
@@ -723,6 +724,14 @@ handler runs on the flusher's goroutine — copy what you keep, and do not block
   deleting it. The one blind spot is a length field that is corrupt *and* fails its
   checksum in the final record's header: the next record boundary is unrecoverable, so it
   is indistinguishable from a torn header and is truncated.
+- **Salvaging a damaged log.** For a buffer that has to come back without an operator,
+  `WithSalvage(f)` turns interior corruption into a bounded loss instead of a failed `Open`.
+  The damaged segment is cut back to its last good record, and every segment after it is
+  kept and delivered. The sequence numbers of the lost records become a gap and are never
+  reused. The cut bytes are copied to a `<segment>.corrupt-<offset>-<time>` file beside it,
+  which the buffer never reads or deletes. At most one segment's worth of records is lost
+  (`WithSegmentBytes`). They are not counted in `Dropped`, because nothing can say how many
+  there were. `f` receives a `Salvage` describing each cut, so alert on it.
 - **Crash replay** starts from the last checkpoint, so `WithCheckpointInterval` sets how
   much gets re-delivered. Duplicates are the contract, not a bug. The checkpoint is fsynced
   while `SyncNever` records are not, so it can survive a machine crash that the log tail did

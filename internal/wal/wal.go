@@ -117,6 +117,16 @@ type Options struct {
 	// half-finished rotation would otherwise be left behind. Nil in production.
 	SyncFunc func(*os.File) error
 
+	// Salvage, when set, makes Open cut damage out of the log instead of
+	// refusing to open it. A segment with a bad record that is not a torn tail —
+	// a checksum failure with intact data after it, or a segment cut short that
+	// is not the last — is truncated at the last good record, the bytes from
+	// there on are kept beside it in a .corrupt file, and the numbers of the
+	// records lost become a gap readers step over. Salvage is called once per
+	// damaged segment, before Open returns. Nil, the default, keeps Open
+	// refusing with ErrCorrupt.
+	Salvage func(Salvage)
+
 	// RollbackSyncFunc replaces the fsync a rollback makes after cutting the
 	// segment back. It is deliberately not SyncFunc: a rollback that fails is
 	// what makes the log terminally broken, which is a different fault from a
@@ -224,17 +234,16 @@ func (l *Log) recover() error {
 	if err != nil {
 		return err
 	}
-	type found struct{ base, prevEnd uint64 }
-	var names []found
+	var names []segName
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		if base, prevEnd, ok := parseSegmentName(e.Name()); ok {
-			names = append(names, found{base, prevEnd})
+			names = append(names, segName{base, prevEnd})
 		}
 	}
-	slices.SortFunc(names, func(a, b found) int { return cmp.Compare(a.base, b.base) })
+	slices.SortFunc(names, func(a, b segName) int { return cmp.Compare(a.base, b.base) })
 
 	reserved, err := readReserved(l.dir)
 	if err != nil {
@@ -245,12 +254,21 @@ func (l *Log) recover() error {
 	for i, n := range names {
 		path := filepath.Join(l.dir, segmentName(n.base, n.prevEnd))
 		count, good, torn, err := scanSegment(path, l.opts.MaxRecordBytes)
+		last := i == len(names)-1
+		if err == nil && torn && !last {
+			err = fmt.Errorf("%w: segment %s is truncated but is not the last segment", ErrCorrupt, path)
+		}
+		if errors.Is(err, ErrCorrupt) && l.opts.Salvage != nil {
+			var next *segName
+			if !last {
+				next = &names[i+1]
+			}
+			if err = l.salvage(path, n.base, count, good, next, err); err == nil {
+				torn = false // cut back to good by the salvage itself
+			}
+		}
 		if err != nil {
 			return err
-		}
-		last := i == len(names)-1
-		if torn && !last {
-			return fmt.Errorf("wal: segment %s is truncated but is not the last segment", path)
 		}
 		if torn {
 			if err := os.Truncate(path, good); err != nil {

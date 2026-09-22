@@ -2268,3 +2268,73 @@ func TestOpenRejectsInvalidOptions(t *testing.T) {
 		WithCheckpointInterval(0), WithCapacity(0, 0), WithSync(SyncNever, 0), WithMaxRecordBytes(0))
 	closeBuf(t, b)
 }
+
+// A buffer that must come back unattended can opt into losing the damaged part
+// of a segment rather than all of it. Whatever is delivered after that must
+// still be keyed by the numbers it was written under.
+func TestSalvageLetsADamagedBufferDeliverTheRest(t *testing.T) {
+	dir := t.TempDir()
+	const total = 60
+	down := &recorder{}
+	down.failAll.Store(true)
+	b := openBuf(t, dir, down, fast(WithSegmentBytes(128))...)
+	for i := range total {
+		if err := b.Write(context.Background(), fmt.Sprintf("e%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_ = b.Close(ctx)
+
+	segs, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	slices.Sort(segs)
+	if len(segs) < 3 {
+		t.Fatalf("need at least 3 segments, got %d", len(segs))
+	}
+	// Flip a payload byte in the second record of a middle segment: records
+	// are an 8-byte header and a 4-byte payload.
+	f, err := os.OpenFile(segs[1], os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	f.ReadAt(one[:], 12+8+1)
+	one[0] ^= 0x40
+	f.WriteAt(one[:], 12+8+1)
+	f.Close()
+
+	if _, err := Open[string](dir, &recorder{}, stringCodec{}, fast()...); err == nil {
+		t.Fatal("Open without WithSalvage accepted interior corruption")
+	}
+
+	var salvaged []Salvage
+	up := &recorder{}
+	b2, err := Open[string](dir, up, stringCodec{}, fast(WithSalvage(func(s Salvage) { salvaged = append(salvaged, s) }))...)
+	if err != nil {
+		t.Fatalf("Open with WithSalvage: %v", err)
+	}
+	defer closeBuf(t, b2)
+	if len(salvaged) != 1 || salvaged[0].Path != segs[1] {
+		t.Fatalf("salvage reports = %+v, want one for %s", salvaged, segs[1])
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		got := up.seen()
+		return len(got) > 0 && got[len(got)-1] == fmt.Sprintf("e%03d", total-1)
+	})
+
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	var delivered int
+	for _, bt := range up.batches {
+		for i, r := range bt.Records {
+			if want := fmt.Sprintf("e%03d", bt.ID+uint64(i)-1); r != want {
+				t.Fatalf("key %d delivered %q, want %q: salvage must not renumber records", bt.ID+uint64(i), r, want)
+			}
+			delivered++
+		}
+	}
+	if delivered >= total {
+		t.Fatalf("delivered %d of %d records, so nothing was cut", delivered, total)
+	}
+}

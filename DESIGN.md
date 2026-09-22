@@ -223,6 +223,15 @@ first bad or partial record — a torn tail is expected after a crash, not corru
 cost is sequential I/O, so recovery time is proportional to the *unflushed* backlog, which
 retention keeps small.
 
+A bad record anywhere else fails the open, because cutting there discards records the
+writer was told were durable. `WithSalvage` makes that cut an explicit, opt-in choice. The
+damaged segment is truncated at its last good record, and the bytes after that are copied
+aside first. The next segment's file name is relinked so the lost numbers become a gap,
+which readers already step over. The steps run in the order that makes a crash part-way
+through safe to repeat: copy, relink, cut. Segments are named by their base LSN, so every
+segment after the damage keeps its numbering, and only the rest of the damaged segment is
+lost.
+
 ## The hard parts
 
 1. **Group commit.** Make-or-break for throughput. One committer goroutine; writers park on
