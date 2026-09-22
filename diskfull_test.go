@@ -54,14 +54,10 @@ func writeFailsAfter(failing *atomic.Bool, errno syscall.Errno) func(*os.File, [
 	}
 }
 
-// enospcReserving is the mirror image: only the reservation write fails. That is
-// the other write on the accept path, and the one a full disk hits first,
-// because a fresh directory claims its first block of LSNs before it can stage
-// anything.
-func enospcReserving(failing *atomic.Bool) func(*os.File, []byte) (int, error) {
-	return writeFailsReserving(failing, syscall.ENOSPC)
-}
-
+// writeFailsReserving is the mirror image: only the reservation write fails.
+// That is the other write on the accept path, and the one a full disk hits
+// first, because a fresh directory claims its first block of LSNs before it can
+// stage anything.
 func writeFailsReserving(failing *atomic.Bool, errno syscall.Errno) func(*os.File, []byte) (int, error) {
 	return func(f *os.File, b []byte) (int, error) {
 		if failing.Load() && !isSegment(f) {

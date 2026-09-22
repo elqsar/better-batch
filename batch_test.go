@@ -90,16 +90,6 @@ func (r *recorder) seen() []string {
 	return slices.Clone(r.records)
 }
 
-func (r *recorder) batchIDs() []uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]uint64, len(r.batches))
-	for i, b := range r.batches {
-		ids[i] = b.ID
-	}
-	return ids
-}
-
 func fast(extra ...Option) []Option {
 	return append([]Option{
 		WithSync(SyncNever, 0),
