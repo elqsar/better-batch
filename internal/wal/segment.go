@@ -89,11 +89,11 @@ func parseSegmentName(name string) (baseLSN, prevEnd uint64, ok bool) {
 // record, and a segment the log actually knows about is never re-created.
 func createSegment(dir string, baseLSN, prevEnd uint64) (*segment, error) {
 	path := filepath.Join(dir, segmentName(baseLSN, prevEnd))
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, fileMode)
 	if errors.Is(err, os.ErrExist) {
 		if st, serr := os.Stat(path); serr == nil && st.Size() == 0 {
 			if rerr := os.Remove(path); rerr == nil {
-				f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
+				f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, fileMode)
 			}
 		}
 	}
@@ -129,6 +129,9 @@ func (s *segment) discard() {
 // record with intact data after it cannot be a tear: it is interior corruption,
 // and silently truncating there would discard durable records the writer was
 // told were safe, so it is reported as ErrCorrupt instead.
+//
+// On ErrCorrupt, count and good still describe the intact records in front of
+// the damage, which is what salvaging the segment needs to know.
 //
 // A record longer than maxRecordBytes whose checksum verifies is neither: it is
 // a record written while the limit was larger. Lowering MaxRecordBytes must not
@@ -198,7 +201,7 @@ func scanSegment(path string, maxRecordBytes int) (count uint64, good int64, tru
 		}
 		if checksum(length, payload) != crc {
 			if end := good + recordSize(int(length)); end < total {
-				return 0, 0, false, fmt.Errorf("%w: %s: record at offset %d fails its checksum with %d intact bytes after it",
+				return count, good, false, fmt.Errorf("%w: %s: record at offset %d fails its checksum with %d intact bytes after it",
 					ErrCorrupt, path, good, total-end)
 			}
 			return count, good, true, nil

@@ -90,16 +90,6 @@ func (r *recorder) seen() []string {
 	return slices.Clone(r.records)
 }
 
-func (r *recorder) batchIDs() []uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]uint64, len(r.batches))
-	for i, b := range r.batches {
-		ids[i] = b.ID
-	}
-	return ids
-}
-
 func fast(extra ...Option) []Option {
 	return append([]Option{
 		WithSync(SyncNever, 0),
@@ -355,6 +345,48 @@ func TestRejectPolicyReturnsErrFull(t *testing.T) {
 	}
 	if full == 0 {
 		t.Fatal("no write was rejected even though capacity was 5 and the sink was dead")
+	}
+}
+
+// A policy that waits on its ctx is a reasonable thing to write, and Close waits
+// for every writer. The ctx a policy is handed has to end when Close begins, or
+// such a policy holds the shutdown past the deadline Close was given.
+func TestCloseReleasesAWriterInsideThePolicy(t *testing.T) {
+	sink := &recorder{}
+	sink.delay.Store(int64(time.Hour)) // holds the one slot until Close cancels it
+	entered := make(chan struct{}, 1)
+	policy := PolicyFunc(func(ctx context.Context, _ State) Decision {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return DecisionReject
+	})
+	b := openBuf(t, t.TempDir(), sink, fast(WithCapacity(1, 0), WithOnFull(policy))...)
+
+	if err := b.Write(context.Background(), "fills"); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := make(chan error, 1)
+	go func() { writeErr <- b.Write(context.Background(), "parked") }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second write never reached the policy")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closed := make(chan struct{})
+	go func() { _ = b.Close(ctx); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close is still waiting on a writer parked inside the policy, past its own 1s deadline")
+	}
+	if err := <-writeErr; !errors.Is(err, ErrClosed) {
+		t.Fatalf("parked Write = %v, want ErrClosed", err)
 	}
 }
 
@@ -656,6 +688,34 @@ func TestWriteAfterCloseIsRejected(t *testing.T) {
 	closeBuf(t, b)
 	if err := b.Write(context.Background(), "late"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Write after Close = %v, want ErrClosed", err)
+	}
+}
+
+// A writer that had already given up before calling must not have its record
+// land anyway. ErrUncertain is for a deadline that passes mid-commit; before
+// anything is staged there is nothing uncertain about it.
+func TestWriteWithCancelledContextWritesNothing(t *testing.T) {
+	sink := &recorder{}
+	b := openBuf(t, t.TempDir(), sink, fast()...)
+	defer closeBuf(t, b)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := range 50 {
+		err := b.Write(ctx, fmt.Sprintf("abandoned%d", i))
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrUncertain) {
+			t.Fatalf("Write with a cancelled ctx = %v, want context.Canceled and not ErrUncertain", err)
+		}
+	}
+
+	if err := b.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sink.seen(); len(got) != 0 {
+		t.Fatalf("sink saw %v from writes whose context was already cancelled", got)
+	}
+	if s := b.Stats(); s.Written != 0 || s.PendingRecords != 0 {
+		t.Fatalf("Stats.Written = %d, PendingRecords = %d; want 0 and 0", s.Written, s.PendingRecords)
 	}
 }
 
@@ -1898,10 +1958,10 @@ func TestFailBufferKeepsRecordsForReplay(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for i := range 5 {
-		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
+	// One call, so the first batch cannot reach the failing sink and stop the
+	// buffer while the rest of the setup is still being written.
+	if err := b.WriteBatch(ctx, "e0", "e1", "e2", "e3", "e4"); err != nil {
+		t.Fatalf("write: %v", err)
 	}
 
 	// The failure has to reach a writer rather than only Stats.
@@ -2153,5 +2213,118 @@ func TestObserverReportsRetryAction(t *testing.T) {
 	}
 	if DeadLetterBatch.String() != "dead_letter" {
 		t.Fatalf("RetryAction.String() = %q, want a usable metric label", DeadLetterBatch.String())
+	}
+}
+
+// An option that cannot mean what was asked for used to fall back to its
+// default without a word. Open now refuses it, before it touches the directory.
+func TestOpenRejectsInvalidOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  Option
+	}{
+		{"unknown sync mode", WithSync(SyncMode(99), 0)},
+		{"negative sync interval", WithSync(SyncPeriodic, -time.Millisecond)},
+		{"negative segment size", WithSegmentBytes(-1)},
+		{"negative record size", WithMaxRecordBytes(-1)},
+		{"record size past the header", WithMaxRecordBytes(1 << 32)},
+		{"negative record capacity", WithCapacity(-1, 0)},
+		{"negative byte capacity", WithCapacity(0, -1)},
+		{"negative flush records", WithFlush(-1, 0, 0)},
+		{"negative flush interval", WithFlush(0, 0, -time.Second)},
+		{"negative in-flight", WithMaxInFlight(-1)},
+		{"negative attempts", WithRetry(Backoff{}, -1)},
+		{"negative dead-letter attempts", WithDeadLetterRetry(Backoff{}, -1)},
+		{"negative checkpoint interval", WithCheckpointInterval(-time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "buf")
+			b, err := Open[string](dir, &recorder{}, stringCodec{}, tc.opt)
+			if err == nil {
+				b.Close(context.Background())
+				t.Fatal("Open accepted it")
+			}
+			if !errors.Is(err, ErrInvalidOption) {
+				t.Fatalf("Open = %v, want ErrInvalidOption", err)
+			}
+			if _, serr := os.Stat(dir); !os.IsNotExist(serr) {
+				t.Fatalf("Open created %s before rejecting the option", dir)
+			}
+		})
+	}
+
+	// Zero keeps its documented meaning everywhere.
+	b := openBuf(t, t.TempDir(), &recorder{}, WithFlush(0, 0, 0), WithMaxInFlight(0),
+		WithCheckpointInterval(0), WithCapacity(0, 0), WithSync(SyncNever, 0), WithMaxRecordBytes(0))
+	closeBuf(t, b)
+}
+
+// A buffer that must come back unattended can opt into losing the damaged part
+// of a segment rather than all of it. Whatever is delivered after that must
+// still be keyed by the numbers it was written under.
+func TestSalvageLetsADamagedBufferDeliverTheRest(t *testing.T) {
+	dir := t.TempDir()
+	const total = 60
+	down := &recorder{}
+	down.failAll.Store(true)
+	b := openBuf(t, dir, down, fast(WithSegmentBytes(128))...)
+	for i := range total {
+		if err := b.Write(context.Background(), fmt.Sprintf("e%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_ = b.Close(ctx)
+
+	segs, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	slices.Sort(segs)
+	if len(segs) < 3 {
+		t.Fatalf("need at least 3 segments, got %d", len(segs))
+	}
+	// Flip a payload byte in the second record of a middle segment: records
+	// are an 8-byte header and a 4-byte payload.
+	f, err := os.OpenFile(segs[1], os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	f.ReadAt(one[:], 12+8+1)
+	one[0] ^= 0x40
+	f.WriteAt(one[:], 12+8+1)
+	f.Close()
+
+	if _, err := Open[string](dir, &recorder{}, stringCodec{}, fast()...); err == nil {
+		t.Fatal("Open without WithSalvage accepted interior corruption")
+	}
+
+	var salvaged []Salvage
+	up := &recorder{}
+	b2, err := Open[string](dir, up, stringCodec{}, fast(WithSalvage(func(s Salvage) { salvaged = append(salvaged, s) }))...)
+	if err != nil {
+		t.Fatalf("Open with WithSalvage: %v", err)
+	}
+	defer closeBuf(t, b2)
+	if len(salvaged) != 1 || salvaged[0].Path != segs[1] {
+		t.Fatalf("salvage reports = %+v, want one for %s", salvaged, segs[1])
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		got := up.seen()
+		return len(got) > 0 && got[len(got)-1] == fmt.Sprintf("e%03d", total-1)
+	})
+
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	var delivered int
+	for _, bt := range up.batches {
+		for i, r := range bt.Records {
+			if want := fmt.Sprintf("e%03d", bt.ID+uint64(i)-1); r != want {
+				t.Fatalf("key %d delivered %q, want %q: salvage must not renumber records", bt.ID+uint64(i), r, want)
+			}
+			delivered++
+		}
+	}
+	if delivered >= total {
+		t.Fatalf("delivered %d of %d records, so nothing was cut", delivered, total)
 	}
 }

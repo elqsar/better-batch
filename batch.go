@@ -55,6 +55,27 @@ var (
 	// them either way. Retrying produces a duplicate, which at-least-once
 	// delivery already allows.
 	ErrUncertain = errors.New("batch: write outcome uncertain")
+
+	// ErrPanic marks a panic the buffer recovered from code it was calling: a
+	// Sink, a Codec's Decode, a WithOnSinkError or WithOnDecodeFailure handler,
+	// or an Observer hook. Those run on the buffer's own goroutines, where a panic would take
+	// the whole process down and the caller has no frame to recover it in.
+	//
+	// A panicking sink or handler fails the buffer, as FailBuffer does: nothing
+	// is disposed of, and every record still pending replays on the next Open.
+	// The error wraps ErrPanic and carries the panic value and stack, so
+	// Stats().Err says where it happened. A panicking Observer hook is counted
+	// in Stats().ObserverDropped instead, because losing a metric is not a
+	// reason to stop the pipeline. A Decode that panics is a record that did
+	// not decode: its DecodeFailure.Err matches ErrPanic, and it is dropped or
+	// kept as WithOnDecodeFailure decides.
+	ErrPanic = errors.New("batch: panicked")
+
+	// ErrInvalidOption means Open was given an option no reading can make
+	// sense of: a negative limit, an unknown SyncMode, a record size the log's
+	// header cannot describe. Open reports every such option at once, before
+	// it touches the directory.
+	ErrInvalidOption = errors.New("batch: invalid option")
 )
 
 // isDiskFull reports whether an error is the filesystem refusing to grow the
@@ -91,6 +112,10 @@ type Buffer[T any] struct {
 	pendingBytes   atomic.Int64
 	ages           ageTracker // age of the oldest unflushed record
 	sinkFailures   atomic.Int64
+
+	// observerPanics counts synchronous Observer hooks that panicked. The
+	// asynchronous dispatcher keeps its own count alongside what it drops.
+	observerPanics atomic.Uint64
 
 	// failingBatches counts deliveries that have failed at least once and have
 	// not yet resolved. With MaxInFlight above 1 a healthy batch's success must
@@ -131,6 +156,12 @@ type Buffer[T any] struct {
 	deliverCtx    context.Context
 	deliverCancel context.CancelFunc
 
+	// closingCtx is cancelled when Close begins. It is what reaches a Policy
+	// waiting on its ctx: Close waits for every writer, so a policy parked on
+	// the writer's own ctx alone would hold the shutdown past its deadline.
+	closingCtx    context.Context
+	closingCancel context.CancelFunc
+
 	closeOnce sync.Once
 	closeErr  error // set inside closeOnce; every Close returns it
 	lastCP    atomic.Uint64
@@ -155,6 +186,10 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	cfg.wal.SyncMode, _ = walSyncMode(cfg.syncMode)
 
 	var dlq Sink[T]
 	if cfg.deadLetter != nil {
@@ -217,6 +252,7 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 		cpDone:   make(chan struct{}),
 	}
 	b.deliverCtx, b.deliverCancel = context.WithCancel(context.Background())
+	b.closingCtx, b.closingCancel = context.WithCancel(context.Background())
 	b.lastCP.Store(checkpoint)
 	b.floor.Store(checkpoint + 1)
 
@@ -286,11 +322,13 @@ func (b *Buffer[T]) Write(ctx context.Context, v T) error {
 // A batch larger than the whole configured capacity fails immediately with
 // ErrTooLarge, whatever the policy: no amount of draining could admit it.
 //
-// If ctx expires after the records have been staged but before their commit
-// round finishes, WriteBatch returns ErrUncertain wrapping the context error:
-// the records may still be committed and delivered. The buffer settles its own
-// accounting either way, so the caller's only decision is whether to retry and
-// accept a possible duplicate.
+// A ctx that is already done when WriteBatch is called fails it with the
+// context's own error, and nothing is written. If ctx expires later — after the
+// records have been staged but before their commit round finishes — WriteBatch
+// returns ErrUncertain wrapping the context error: the records may still be
+// committed and delivered. The buffer settles its own accounting either way, so
+// the caller's only decision is whether to retry and accept a possible
+// duplicate.
 func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 	if len(vs) == 0 {
 		return nil
@@ -299,6 +337,14 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 		return err
 	}
 	defer b.writers.Done()
+
+	// Asked before anything is reserved or staged. Past this point the records
+	// can land even though the caller has given up, which is ErrUncertain's
+	// business; a caller who had already given up must not get that answer,
+	// or a write it abandoned before making it.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	var enc []byte
 	ends := make([]int, len(vs))
@@ -324,8 +370,10 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 	// One clock for the whole call, so a policy sees how long this write has
 	// been trying whether it was parked on capacity or on a full disk.
 	began := time.Now()
+	var pc policyCtx
+	defer pc.release()
 	for attempt := 1; ; attempt++ {
-		admitted, err := b.admit(ctx, n, size, began)
+		admitted, err := b.admit(ctx, &pc, n, size, began)
 		if err != nil || !admitted {
 			return err
 		}
@@ -365,7 +413,7 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 		// The filesystem is the limit, not the configured capacity. A failed
 		// commit is rolled back by the log, so retrying is safe once the
 		// flusher has drained enough to truncate a segment away.
-		retry, err := b.onDiskFull(ctx, n, size, attempt, began)
+		retry, err := b.onDiskFull(ctx, &pc, n, size, attempt, began)
 		if err != nil || !retry {
 			return err
 		}
@@ -373,7 +421,7 @@ func (b *Buffer[T]) WriteBatch(ctx context.Context, vs ...T) error {
 }
 
 // onDiskFull runs the backpressure policy for a write the log had no room for.
-func (b *Buffer[T]) onDiskFull(ctx context.Context, n, size int64, attempt int, began time.Time) (bool, error) {
+func (b *Buffer[T]) onDiskFull(ctx context.Context, pc *policyCtx, n, size int64, attempt int, began time.Time) (bool, error) {
 	b.counters.diskFull.Add(1)
 
 	// Take the gate before deciding, so space freed while the policy runs
@@ -382,8 +430,10 @@ func (b *Buffer[T]) onDiskFull(ctx context.Context, n, size int64, attempt int, 
 	st := b.state(attempt, time.Since(began))
 	st.DiskFull = true
 
-	decision := b.cfg.policy.OnFull(ctx, st)
-	b.observeBackpressure(st, decision)
+	decision, err := b.decide(ctx, pc, st)
+	if err != nil {
+		return false, err
+	}
 
 	switch decision {
 	case DecisionReject:
@@ -515,7 +565,7 @@ func (b *Buffer[T]) release(n, size int64) {
 
 // admit applies the backpressure policy until the write fits, is refused, or is
 // dropped. A false first return with a nil error means the policy dropped it.
-func (b *Buffer[T]) admit(ctx context.Context, n, size int64, began time.Time) (bool, error) {
+func (b *Buffer[T]) admit(ctx context.Context, pc *policyCtx, n, size int64, began time.Time) (bool, error) {
 	wait := blockRetryFloor
 	for attempt := 1; ; attempt++ {
 		// Take the gate before testing capacity, so a release that happens
@@ -535,8 +585,10 @@ func (b *Buffer[T]) admit(ctx context.Context, n, size int64, began time.Time) (
 		}
 
 		st := b.state(attempt, time.Since(began))
-		decision := b.cfg.policy.OnFull(ctx, st)
-		b.observeBackpressure(st, decision)
+		decision, err := b.decide(ctx, pc, st)
+		if err != nil {
+			return false, err
+		}
 
 		switch decision {
 		case DecisionReject:
@@ -565,6 +617,47 @@ func (b *Buffer[T]) admit(ctx context.Context, n, size int64, began time.Time) (
 		}
 		timer.Stop()
 		wait = min(2*wait, blockRetryInterval)
+	}
+}
+
+// decide consults the policy about a write that does not fit.
+//
+// A Close that began while the policy was deciding outranks whatever it
+// decided: the policy was most likely released by the cancelled ctx rather
+// than by thinking it over, and shedding the backlog on the way out of a
+// shutdown is not something anybody asked for.
+func (b *Buffer[T]) decide(ctx context.Context, pc *policyCtx, st State) (Decision, error) {
+	decision := b.cfg.policy.OnFull(pc.get(ctx, b.closingCtx), st)
+	b.observeBackpressure(st, decision)
+	select {
+	case <-b.closing:
+		return decision, ErrClosed
+	default:
+		return decision, nil
+	}
+}
+
+// policyCtx is the ctx a Policy is handed: the writer's own, cancelled as well
+// when Close begins. It is built on first use, because most writes never
+// consult the policy and should not pay for a context they do not need.
+type policyCtx struct {
+	ctx  context.Context
+	stop func()
+}
+
+func (p *policyCtx) get(ctx, closing context.Context) context.Context {
+	if p.ctx == nil {
+		c, cancel := context.WithCancel(ctx)
+		unhook := context.AfterFunc(closing, cancel)
+		p.ctx = c
+		p.stop = func() { unhook(); cancel() }
+	}
+	return p.ctx
+}
+
+func (p *policyCtx) release() {
+	if p.stop != nil {
+		p.stop()
 	}
 }
 

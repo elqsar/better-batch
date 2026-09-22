@@ -155,6 +155,9 @@ case err != nil:
 }
 ```
 
+A `ctx` that is already done when `Write` is called is a different case: nothing has been
+staged, so `Write` returns the context's own error and writes nothing.
+
 The wrapped context error is preserved, so `errors.Is(err, context.DeadlineExceeded)` still
 works. The buffer settles its own accounting in the background either way — the backlog
 figures in `Stats()` stay exact whichever way the commit round goes.
@@ -368,9 +371,10 @@ batch.WithAsyncObserver(observer(), 1024)
 ```
 
 A hook may then block, and may call back into the `Buffer` freely. The price is that events
-are dropped rather than queued without bound when a hook cannot keep up, and that a panicking
-hook is recovered rather than crashing the process. `Stats().ObserverDropped` counts both, so
-a hook that is too slow shows up as missing metrics instead of missing throughput.
+are dropped rather than queued without bound when a hook cannot keep up.
+`Stats().ObserverDropped` counts them, so a hook that is too slow shows up as missing metrics
+instead of missing throughput. It also counts hooks that panicked, inline or not: a panicking
+hook is recovered rather than crashing the process.
 
 It does not apply to `Policy.OnFull`, `WithOnSinkError` or `WithOnDecodeFailure`: the buffer
 acts on what those return, so they stay synchronous and the warnings above still hold for them.
@@ -651,6 +655,7 @@ checkpoint succeeds and the buffer keeps working meanwhile, while `Err` is termi
 | `WithCheckpointInterval(d)` | 200ms | longer means fewer fsyncs, more replay after a crash |
 | `WithSegmentBytes(n)` | 64 MiB | soft cap; segments may overshoot by one commit batch |
 | `WithMaxRecordBytes(n)` | 4 MiB | largest single encoded record; lowering it below stored records fails `Open` |
+| `WithSalvage(f)` | off | cut interior corruption out on `Open` instead of failing; `f` reports each cut |
 | `WithObserver(o)` | none | metrics hooks, run inline |
 | `WithAsyncObserver(o, queue)` | none | metrics hooks that may block or re-enter |
 
@@ -698,6 +703,9 @@ handler runs on the flusher's goroutine — copy what you keep, and do not block
 
 ## Operational notes
 
+- **Owner-only files.** The buffer creates its directory `0700` and its files `0600`: the
+  log holds whatever you buffer, which is often user data. A directory that already exists
+  keeps the mode it has, and so do files written by an older version.
 - **One writer per directory**, enforced with a lock file. A second `Open` fails. The lock
   is `flock`, so enforcement is Unix-only; elsewhere the single-writer rule is yours to keep.
 - **Sequence numbers are never reused.** They are claimed durably, a block at a time, before
@@ -716,6 +724,14 @@ handler runs on the flusher's goroutine — copy what you keep, and do not block
   deleting it. The one blind spot is a length field that is corrupt *and* fails its
   checksum in the final record's header: the next record boundary is unrecoverable, so it
   is indistinguishable from a torn header and is truncated.
+- **Salvaging a damaged log.** For a buffer that has to come back without an operator,
+  `WithSalvage(f)` turns interior corruption into a bounded loss instead of a failed `Open`.
+  The damaged segment is cut back to its last good record, and every segment after it is
+  kept and delivered. The sequence numbers of the lost records become a gap and are never
+  reused. The cut bytes are copied to a `<segment>.corrupt-<offset>-<time>` file beside it,
+  which the buffer never reads or deletes. At most one segment's worth of records is lost
+  (`WithSegmentBytes`). They are not counted in `Dropped`, because nothing can say how many
+  there were. `f` receives a `Salvage` describing each cut, so alert on it.
 - **Crash replay** starts from the last checkpoint, so `WithCheckpointInterval` sets how
   much gets re-delivered. Duplicates are the contract, not a bug. The checkpoint is fsynced
   while `SyncNever` records are not, so it can survive a machine crash that the log tail did

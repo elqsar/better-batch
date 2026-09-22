@@ -223,6 +223,15 @@ first bad or partial record — a torn tail is expected after a crash, not corru
 cost is sequential I/O, so recovery time is proportional to the *unflushed* backlog, which
 retention keeps small.
 
+A bad record anywhere else fails the open, because cutting there discards records the
+writer was told were durable. `WithSalvage` makes that cut an explicit, opt-in choice. The
+damaged segment is truncated at its last good record, and the bytes after that are copied
+aside first. The next segment's file name is relinked so the lost numbers become a gap,
+which readers already step over. The steps run in the order that makes a crash part-way
+through safe to repeat: copy, relink, cut. Segments are named by their base LSN, so every
+segment after the damage keeps its numbering, and only the rest of the damaged segment is
+lost.
+
 ## The hard parts
 
 1. **Group commit.** Make-or-break for throughput. One committer goroutine; writers park on
@@ -267,7 +276,9 @@ retention keeps small.
    commits, driving the backlog counters negative and letting `reserve` over-admit against a
    cap it can no longer measure. The writer hands the outcome to a settler goroutine that
    waits out the round, and `ErrUncertain` tells the caller the truth in the meantime.
-   Cancelling a write cancels the *waiting*, never the write.
+   Once a record is staged, cancelling cancels the *waiting*, never the write. A context
+   that is already done before anything is staged fails the write outright, with nothing
+   written.
 
 ## Testing
 
@@ -278,9 +289,13 @@ The whole value proposition is "survives a crash", so that is what gets tested h
   no records lost below the last successful ack.
 - fsync fault injection: a `syncer` interface so tests can fail, delay, or silently drop
   syncs.
-- Property tests over the record/segment layer: arbitrary payload sizes, arbitrary
-  truncation points, arbitrary bit flips → never panic, never return a bad record.
-- Race detector and a concurrent-writers throughput benchmark in CI.
+- Fuzzing over the record and segment layer. `FuzzScanSegment` feeds recovery's scanner
+  arbitrary bytes. `FuzzRecover` damages one byte of a real log, then opens it with and
+  without salvage. Neither may panic or return a record under a number that named a
+  different one, and a salvaging open must always succeed. CI runs both for 30 s on every
+  push; the seed corpora run with the ordinary tests.
+- Race detector in CI, against both the minimum Go version in `go.mod` and the latest
+  release, plus staticcheck and govulncheck.
 
 ## Measured
 

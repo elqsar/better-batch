@@ -26,7 +26,7 @@ const reserveBlock = 1 << 20
 func (l *Log) writeReserved(lsn uint64) error {
 	dir := l.dir
 	tmp := filepath.Join(dir, reservedName+".tmp")
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileMode)
 	if err != nil {
 		return err
 	}

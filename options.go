@@ -1,6 +1,8 @@
 package batch
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/elqsar/better-batch/internal/wal"
@@ -27,7 +29,8 @@ const (
 )
 
 type config struct {
-	wal wal.Options
+	wal      wal.Options
+	syncMode SyncMode // mapped into wal.SyncMode once validated
 
 	maxRecords int64
 	maxBytes   int64
@@ -92,23 +95,70 @@ type Option func(*config)
 // bounds how long a write waits to be committed with others; it defaults to 5ms.
 func WithSync(mode SyncMode, interval time.Duration) Option {
 	return func(c *config) {
-		c.wal.SyncMode = walSyncMode(mode)
+		c.syncMode = mode
 		c.wal.SyncInterval = interval
 	}
 }
 
 // walSyncMode maps the public mode explicitly rather than converting the
 // integer, so reordering either set of constants cannot silently change what a
-// caller asked for.
-func walSyncMode(m SyncMode) wal.SyncMode {
+// caller asked for. A mode it does not know is reported rather than read as the
+// default: a caller who asked for something else would get weaker durability
+// than they believe they have, or slower writes, and no sign of either.
+func walSyncMode(m SyncMode) (wal.SyncMode, bool) {
 	switch m {
+	case SyncPeriodic:
+		return wal.SyncPeriodic, true
 	case SyncAlways:
-		return wal.SyncAlways
+		return wal.SyncAlways, true
 	case SyncNever:
-		return wal.SyncNever
+		return wal.SyncNever, true
 	default:
-		return wal.SyncPeriodic
+		return 0, false
 	}
+}
+
+// validate reports every option that cannot mean what the caller asked for. An
+// option that quietly fell back to its default instead would hide a typo or a
+// sign error until the buffer behaved differently under load, which is the
+// worst time to find out. Zero keeps its documented meaning — the default, or
+// unlimited — so only values no reading can make sense of are refused.
+func (c *config) validate() error {
+	var errs []error
+	bad := func(option, format string, args ...any) {
+		errs = append(errs, fmt.Errorf("%w: %s: %s", ErrInvalidOption, option, fmt.Sprintf(format, args...)))
+	}
+	if _, ok := walSyncMode(c.syncMode); !ok {
+		bad("WithSync", "unknown SyncMode %d", c.syncMode)
+	}
+	if c.wal.SyncInterval < 0 {
+		bad("WithSync", "negative interval %v", c.wal.SyncInterval)
+	}
+	if c.wal.MaxSegmentBytes < 0 {
+		bad("WithSegmentBytes", "negative size %d", c.wal.MaxSegmentBytes)
+	}
+	if n := c.wal.MaxRecordBytes; n < 0 || int64(n) > wal.MaxRecordLimit {
+		bad("WithMaxRecordBytes", "%d is outside 0..%d, the most a record header can describe", n, int64(wal.MaxRecordLimit))
+	}
+	if c.maxRecords < 0 || c.maxBytes < 0 {
+		bad("WithCapacity", "negative limit (%d records, %d bytes)", c.maxRecords, c.maxBytes)
+	}
+	if c.flushRecords < 0 || c.flushBytes < 0 || c.flushInterval < 0 {
+		bad("WithFlush", "negative trigger (%d records, %d bytes, %v)", c.flushRecords, c.flushBytes, c.flushInterval)
+	}
+	if c.maxInFlight < 0 {
+		bad("WithMaxInFlight", "negative count %d", c.maxInFlight)
+	}
+	if c.maxAttempts < 0 {
+		bad("WithRetry", "negative maxAttempts %d", c.maxAttempts)
+	}
+	if c.dlqAttempts < 0 {
+		bad("WithDeadLetterRetry", "negative maxAttempts %d", c.dlqAttempts)
+	}
+	if c.checkpointInterval < 0 {
+		bad("WithCheckpointInterval", "negative interval %v", c.checkpointInterval)
+	}
+	return errors.Join(errs...)
 }
 
 // WithSegmentBytes sets the soft cap on log segment size. Rotation happens
@@ -148,13 +198,13 @@ func WithCapacity(maxRecords int64, maxBytes int64) Option {
 // passed with anything buffered. Zero leaves a trigger at its default.
 func WithFlush(maxRecords, maxBytes int, maxInterval time.Duration) Option {
 	return func(c *config) {
-		if maxRecords > 0 {
+		if maxRecords != 0 {
 			c.flushRecords = maxRecords
 		}
-		if maxBytes > 0 {
+		if maxBytes != 0 {
 			c.flushBytes = maxBytes
 		}
-		if maxInterval > 0 {
+		if maxInterval != 0 {
 			c.flushInterval = maxInterval
 		}
 	}
@@ -165,7 +215,7 @@ func WithFlush(maxRecords, maxBytes int, maxInterval time.Duration) Option {
 // the sink must be safe for concurrent use.
 func WithMaxInFlight(n int) Option {
 	return func(c *config) {
-		if n > 0 {
+		if n != 0 {
 			c.maxInFlight = n
 		}
 	}
@@ -295,10 +345,10 @@ const defaultObserverQueue = 1024
 // have been waiting on has already moved on.
 //
 // The price is that events are dropped rather than queued without bound when a
-// hook cannot keep up, and that a hook which panics is recovered rather than
-// crashing the process. Stats().ObserverDropped counts both, so a hook that is
-// too slow or too fragile shows up as missing metrics instead of as missing
-// throughput. A queue of zero or less gets a reasonable default.
+// hook cannot keep up. Stats().ObserverDropped counts them, alongside any hook
+// that panicked, so a hook that is too slow or too fragile shows up as missing
+// metrics instead of as missing throughput. A queue of zero or less gets a
+// reasonable default.
 //
 // It does not apply to Policy.OnFull, WithOnSinkError or WithOnDecodeFailure:
 // the buffer acts on what those return, so they have to stay synchronous.
@@ -309,6 +359,59 @@ func WithAsyncObserver(o Observer, queue int) Option {
 	return func(c *config) { c.observer = o; c.observerQueue = queue }
 }
 
+// Salvage describes damage that WithSalvage cut out of the log while opening it.
+type Salvage struct {
+	// Path is the damaged segment file. It now ends at Offset.
+	Path string
+
+	// Offset is where the first bad record started. Every record before it was
+	// intact and is kept.
+	Offset int64
+
+	// DiscardedBytes is how much was cut, from Offset to the end of the
+	// segment. The records in it cannot be counted: the damage is what would
+	// have said where each one ends.
+	DiscardedBytes int64
+
+	// Kept is the file the discarded bytes were copied to, beside the segment.
+	// The buffer never reads or deletes it; it is there for forensics, or for
+	// recovering records by hand.
+	Kept string
+
+	// Cause describes the damage recovery found.
+	Cause error
+}
+
+// WithSalvage makes Open cut damage out of the log instead of refusing to open
+// it.
+//
+// By default Open fails on a bad record that is not a torn tail — a checksum
+// failure with intact records after it, or a segment cut short that is not the
+// last one — because truncating there discards records the writer was told were
+// durable, and the only way forward is an operator's decision. WithSalvage is
+// that decision made in advance: the damaged segment is cut back to its last
+// good record, the bytes from there on are copied to a .corrupt file beside it,
+// and the sequence numbers of the records lost with them become a gap that is
+// never reused. Every segment after the damage is kept and delivered.
+//
+// What is lost is the rest of the damaged segment, up to WithSegmentBytes of
+// records, which are gone from the pipeline without being counted as dropped:
+// nothing can say how many there were. f is called once per damaged segment,
+// before Open returns, and may be nil. Reach for this on a buffer that must come
+// back unattended, and alert on f; leave it off where a person should look first.
+//
+// A record above WithMaxRecordBytes whose checksum verifies is not damage — it
+// was written under a larger limit — and still fails Open.
+func WithSalvage(f func(Salvage)) Option {
+	return func(c *config) {
+		c.wal.Salvage = func(s wal.Salvage) {
+			if f != nil {
+				f(Salvage{Path: s.Path, Offset: s.Offset, DiscardedBytes: s.DiscardedBytes, Kept: s.Kept, Cause: s.Cause})
+			}
+		}
+	}
+}
+
 // WithCheckpointInterval sets how often the low-water mark is persisted.
 //
 // The checkpoint is an optimisation, not a correctness requirement: a crash
@@ -316,7 +419,7 @@ func WithAsyncObserver(o Observer, queue int) Option {
 // after a crash for fewer fsyncs during normal running.
 func WithCheckpointInterval(d time.Duration) Option {
 	return func(c *config) {
-		if d > 0 {
+		if d != 0 {
 			c.checkpointInterval = d
 		}
 	}

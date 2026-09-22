@@ -1,6 +1,7 @@
 package batch
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -117,13 +118,15 @@ func (b *Buffer[T]) flusher(from uint64) {
 			if lsn < b.floor.Load() {
 				b.dropped(1, ReasonPolicy)
 				skip = true
-			} else if decoded, derr := b.codec.Decode(payload); derr != nil {
+			} else if decoded, derr := b.decode(payload); derr != nil {
 				// A record that will not decode can never be delivered by this
 				// codec. Dropping it keeps the pipeline moving; the handler can
 				// ask to stop instead and keep it for a codec that understands
 				// it, which is what a codec changed between runs needs.
-				if b.decodeFailure(lsn, payload, derr) == StopBuffer {
-					stopLSN, stopErr = lsn, derr
+				if action, herr := b.decodeFailure(lsn, payload, derr); action == StopBuffer {
+					// A handler that panicked stops too: it never said the
+					// record could go, so it stays for the next Open.
+					stopLSN, stopErr = lsn, cmp.Or(herr, derr)
 					break
 				}
 				b.dropped(1, ReasonDecode)
@@ -289,7 +292,11 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 		}
 		batch.Attempt = attempt
 		started := time.Now()
-		err := b.sink.Flush(b.deliverCtx, batch)
+		var err error
+		if perr := protect(func() { err = b.sink.Flush(b.deliverCtx, batch) }); perr != nil {
+			b.sinkPanicked(batch, p, attempt, false, started, perr)
+			return
+		}
 		d := b.classify(SinkFailure{
 			ID:      batch.ID,
 			Records: int(p.count),
@@ -381,7 +388,14 @@ func (b *Buffer[T]) classify(f SinkFailure) RetryDecision {
 		return RetryDecision{}
 	}
 	if h := b.cfg.onSinkError; h != nil {
-		return h(f)
+		var d RetryDecision
+		if perr := protect(func() { d = h(f) }); perr != nil {
+			// The handler never gave a verdict, so nothing may be disposed of
+			// on its behalf: stop with the batch kept, as FailBuffer does.
+			b.fail(fmt.Errorf("batch: WithOnSinkError handler on batch %d: %w", f.ID, perr))
+			return RetryDecision{Action: FailBuffer}
+		}
+		return d
 	}
 	var ra *retryAfterError
 	switch {
@@ -457,7 +471,11 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 		}
 		batch.Attempt = attempt
 		started := time.Now()
-		err := b.dlq.Flush(b.deliverCtx, batch)
+		var err error
+		if perr := protect(func() { err = b.dlq.Flush(b.deliverCtx, batch) }); perr != nil {
+			b.sinkPanicked(batch, p, attempt, true, started, perr)
+			return
+		}
 		d := b.classify(SinkFailure{
 			ID:         batch.ID,
 			Records:    int(p.count),
@@ -518,15 +536,56 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 	}
 }
 
+// sinkPanicked handles a sink that panicked instead of answering. A panic is
+// almost always a bug that recurs on every call, so retrying would only loop
+// on it; disposing of the batch would lose records to a bug that a fixed build
+// delivers. The buffer fails with the range unacknowledged, exactly as
+// FailBuffer leaves it, and the next Open replays it.
+func (b *Buffer[T]) sinkPanicked(batch Batch[T], p pending[T], attempt int, deadLetter bool, started time.Time, perr error) {
+	b.observeFlush(FlushInfo{
+		ID:         batch.ID,
+		Records:    int(p.count),
+		Bytes:      int(p.bytes),
+		Attempt:    attempt,
+		DeadLetter: deadLetter,
+		Action:     FailBuffer,
+		Duration:   time.Since(started),
+		Err:        perr,
+	})
+	which := "sink"
+	if deadLetter {
+		which = "dead-letter sink"
+	}
+	b.fail(fmt.Errorf("batch: %s on batch %d: %w", which, batch.ID, perr))
+}
+
+// decode runs the codec on the flusher's goroutine, where a panic has no frame
+// of the caller's to be recovered in. A codec that panics on a payload is a
+// codec that could not decode it, so the panic becomes the decode error and the
+// record goes where any undecodable record goes: WithOnDecodeFailure decides,
+// and StopBuffer keeps it for a codec that is fixed.
+func (b *Buffer[T]) decode(payload []byte) (v T, err error) {
+	if perr := protect(func() { v, err = b.codec.Decode(payload) }); perr != nil {
+		var zero T
+		return zero, fmt.Errorf("codec: %w", perr)
+	}
+	return v, err
+}
+
 // decodeFailure asks the configured handler what to do about a record the codec
 // refused. Without one, the record is dropped, which is what the buffer has
-// always done.
-func (b *Buffer[T]) decodeFailure(lsn uint64, payload []byte, err error) DecodeAction {
+// always done. A handler that panics answers StopBuffer, and the returned error
+// says why.
+func (b *Buffer[T]) decodeFailure(lsn uint64, payload []byte, err error) (DecodeAction, error) {
 	f := b.cfg.onDecodeFailure
 	if f == nil {
-		return DropRecord
+		return DropRecord, nil
 	}
-	return f(DecodeFailure{LSN: lsn, Payload: payload, Err: err})
+	var action DecodeAction
+	if perr := protect(func() { action = f(DecodeFailure{LSN: lsn, Payload: payload, Err: err}) }); perr != nil {
+		return StopBuffer, fmt.Errorf("WithOnDecodeFailure handler: %w", perr)
+	}
+	return action, nil
 }
 
 // completeRange acknowledges everything the batch's range covers: its own
@@ -652,8 +711,9 @@ func (b *Buffer[T]) Close(ctx context.Context) error {
 		b.sealed = true
 		b.mu.Unlock()
 
-		close(b.closing) // release writers parked on the capacity gate
-		b.writers.Wait() // let already-accepted writes finish appending
+		close(b.closing)  // release writers parked on the capacity gate
+		b.closingCancel() // and any parked inside a Policy
+		b.writers.Wait()  // let already-accepted writes finish appending
 		close(b.drainNow)
 
 		timedOut := false
@@ -728,9 +788,8 @@ type Stats struct {
 	DiskFullEvents uint64 // writes that found the log unable to grow
 
 	// ObserverDropped counts events the asynchronous observer's queue could not
-	// accept, plus any callback that panicked. It is always zero without
-	// WithAsyncObserver. Anything above zero means the metrics are incomplete,
-	// not that records were lost.
+	// accept, plus any callback that panicked, synchronous or not. Anything
+	// above zero means the metrics are incomplete, not that records were lost.
 	ObserverDropped uint64
 
 	Checkpoint   uint64 // last persisted low-water mark
@@ -769,13 +828,14 @@ func (b *Buffer[T]) Stats() Stats {
 	}
 }
 
-// observerDropped reports what the asynchronous observer could not deliver,
-// zero when the callbacks run inline.
+// observerDropped reports the hooks that panicked and, with WithAsyncObserver,
+// the events its queue could not take.
 func (b *Buffer[T]) observerDropped() uint64 {
-	if b.obs == nil {
-		return 0
+	n := b.observerPanics.Load()
+	if b.obs != nil {
+		n += b.obs.dropped.Load()
 	}
-	return b.obs.dropped.Load()
+	return n
 }
 
 // noteRetryable records a failure that the next checkpoint tick will retry.
