@@ -276,7 +276,9 @@ lost.
    commits, driving the backlog counters negative and letting `reserve` over-admit against a
    cap it can no longer measure. The writer hands the outcome to a settler goroutine that
    waits out the round, and `ErrUncertain` tells the caller the truth in the meantime.
-   Cancelling a write cancels the *waiting*, never the write.
+   Once a record is staged, cancelling cancels the *waiting*, never the write. A context
+   that is already done before anything is staged fails the write outright, with nothing
+   written.
 
 ## Testing
 
@@ -287,9 +289,13 @@ The whole value proposition is "survives a crash", so that is what gets tested h
   no records lost below the last successful ack.
 - fsync fault injection: a `syncer` interface so tests can fail, delay, or silently drop
   syncs.
-- Property tests over the record/segment layer: arbitrary payload sizes, arbitrary
-  truncation points, arbitrary bit flips → never panic, never return a bad record.
-- Race detector and a concurrent-writers throughput benchmark in CI.
+- Fuzzing over the record and segment layer. `FuzzScanSegment` feeds recovery's scanner
+  arbitrary bytes. `FuzzRecover` damages one byte of a real log, then opens it with and
+  without salvage. Neither may panic or return a record under a number that named a
+  different one, and a salvaging open must always succeed. CI runs both for 30 s on every
+  push; the seed corpora run with the ordinary tests.
+- Race detector in CI, against both the minimum Go version in `go.mod` and the latest
+  release, plus staticcheck and govulncheck.
 
 ## Measured
 
