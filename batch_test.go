@@ -1898,10 +1898,10 @@ func TestFailBufferKeepsRecordsForReplay(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for i := range 5 {
-		if err := b.Write(ctx, fmt.Sprintf("e%d", i)); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
+	// One call, so the first batch cannot reach the failing sink and stop the
+	// buffer while the rest of the setup is still being written.
+	if err := b.WriteBatch(ctx, "e0", "e1", "e2", "e3", "e4"); err != nil {
+		t.Fatalf("write: %v", err)
 	}
 
 	// The failure has to reach a writer rather than only Stats.
