@@ -45,11 +45,15 @@ jobs:
         with:
           go-version: stable
 
+      # Pinned, so a run can be reproduced and a new release of either tool
+      # arrives as a reviewed change here rather than silently. Kept out of
+      # go.mod on purpose: the module has no dependencies, and a tool
+      # directive would give it some.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   fuzz:
     runs-on: ubuntu-latest
