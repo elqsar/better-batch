@@ -89,11 +89,11 @@ func parseSegmentName(name string) (baseLSN, prevEnd uint64, ok bool) {
 // record, and a segment the log actually knows about is never re-created.
 func createSegment(dir string, baseLSN, prevEnd uint64) (*segment, error) {
 	path := filepath.Join(dir, segmentName(baseLSN, prevEnd))
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, fileMode)
 	if errors.Is(err, os.ErrExist) {
 		if st, serr := os.Stat(path); serr == nil && st.Size() == 0 {
 			if rerr := os.Remove(path); rerr == nil {
-				f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
+				f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND, fileMode)
 			}
 		}
 	}

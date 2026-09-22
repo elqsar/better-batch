@@ -19,7 +19,7 @@ const checkpointName = "CHECKPOINT"
 // earlier one after a crash.
 func WriteCheckpoint(dir string, lsn uint64) error {
 	tmp := filepath.Join(dir, checkpointName+".tmp")
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileMode)
 	if err != nil {
 		return err
 	}

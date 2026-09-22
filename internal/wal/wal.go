@@ -25,6 +25,15 @@ import (
 	"time"
 )
 
+// dirMode and fileMode are what the log creates its directory and files with.
+// The records are whatever the application buffers — often telemetry carrying
+// user data — so nobody but the owning user gets to read them. Existing files and
+// directories keep the modes they already have.
+const (
+	dirMode  = 0o700
+	fileMode = 0o600
+)
+
 // Errors returned by the log and its readers.
 var (
 	ErrClosed         = errors.New("wal: log is closed")
@@ -173,7 +182,7 @@ type Log struct {
 // implicit LSN numbering cannot be reconstructed across a hole.
 func Open(dir string, opts Options) (*Log, error) {
 	opts = opts.withDefaults()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}
 	lock, err := lockDir(dir)
@@ -277,7 +286,7 @@ func (l *Log) recover() error {
 			l.segs = append(l.segs, s)
 		} else {
 			last := l.segs[len(l.segs)-1]
-			f, err := os.OpenFile(last.path, os.O_RDWR|os.O_APPEND, 0o644)
+			f, err := os.OpenFile(last.path, os.O_RDWR|os.O_APPEND, fileMode)
 			if err != nil {
 				return err
 			}

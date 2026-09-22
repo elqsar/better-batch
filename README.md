@@ -702,6 +702,9 @@ handler runs on the flusher's goroutine — copy what you keep, and do not block
 
 ## Operational notes
 
+- **Owner-only files.** The buffer creates its directory `0700` and its files `0600`: the
+  log holds whatever you buffer, which is often user data. A directory that already exists
+  keeps the mode it has, and so do files written by an older version.
 - **One writer per directory**, enforced with a lock file. A second `Open` fails. The lock
   is `flock`, so enforcement is Unix-only; elsewhere the single-writer rule is yours to keep.
 - **Sequence numbers are never reused.** They are claimed durably, a block at a time, before

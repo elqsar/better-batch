@@ -1129,3 +1129,53 @@ func TestCreateSegmentClearsAnOrphanButNotARealSegment(t *testing.T) {
 		t.Fatal("createSegment took over a segment that holds data")
 	}
 }
+
+// The log holds whatever the application buffers, so nothing it creates may be
+// readable by anyone but the owner. Umask only ever removes bits, so the check
+// holds whatever umask the test runs under.
+func TestCreatedFilesAreOwnerOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "log")
+	l, err := Open(dir, Options{SyncMode: SyncAlways, MaxSegmentBytes: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 { // enough to rotate several times
+		if _, err := l.Append(context.Background(), payload(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteCheckpoint(dir, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("log directory has mode %v, want no group or other access", perm)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var segments int
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s has mode %v, want no group or other access", e.Name(), perm)
+		}
+		if _, _, ok := parseSegmentName(e.Name()); ok {
+			segments++
+		}
+	}
+	if segments < 2 {
+		t.Fatalf("found %d segments, want rotation to have created several", segments)
+	}
+}

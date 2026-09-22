@@ -17,7 +17,7 @@ const lockEnforced = true
 // including when the process dies.
 func lockDir(dir string) (*os.File, error) {
 	path := filepath.Join(dir, "LOCK")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, fileMode)
 	if err != nil {
 		return nil, err
 	}
