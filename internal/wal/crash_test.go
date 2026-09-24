@@ -31,6 +31,11 @@ func runCrashChild(dir string) {
 		if _, err := l.Append(ctx, payload(i)); err != nil {
 			os.Exit(3)
 		}
+		if i == 0 {
+			// Tell the parent a record is durable, so its kill cannot land
+			// before the child has done anything worth recovering.
+			os.Stdout.Write([]byte{'\n'})
+		}
 	}
 }
 
@@ -41,11 +46,32 @@ func TestSurvivesSIGKILL(t *testing.T) {
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestSurvivesSIGKILL")
 	cmd.Env = append(os.Environ(), crashChildEnv+"="+dir)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	cmd.Stderr = os.Stderr
+	ready, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("pipe writer: %v", err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start writer: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	// A fixed sleep raced the child's startup on a slow runner and killed it
+	// before its first commit. Wait for that commit instead, then give it a
+	// moment so the kill lands mid-write rather than just after the first one.
+	committed := make(chan error, 1)
+	go func() {
+		_, err := ready.Read(make([]byte, 1))
+		committed <- err
+	}()
+	select {
+	case err := <-committed:
+		if err != nil {
+			t.Fatalf("writer exited before committing anything: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("writer committed nothing in 30s")
+	}
+	time.Sleep(200 * time.Millisecond)
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill writer: %v", err)
 	}
