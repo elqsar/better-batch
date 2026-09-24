@@ -12,3 +12,8 @@
 idea.md
 progress.md
 .claude/
+
+# Workspace joining the core and connector modules for local development;
+# each module is released against published tags, not against this.
+go.work
+go.work.sum

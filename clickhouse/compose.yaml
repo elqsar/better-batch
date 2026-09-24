@@ -1,0 +1,14 @@
+# A throwaway ClickHouse for the integration tests: task ch:up, task ch:test.
+services:
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: test
+      CLICKHOUSE_PASSWORD: test
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
