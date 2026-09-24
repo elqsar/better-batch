@@ -288,6 +288,15 @@ The handler never sees an error caused by `Close` cancelling delivery — that e
 shutdown talking, not the sink's verdict, and disposing of records on it is a bug the buffer
 has had once already.
 
+## Connectors
+
+Ready-made sinks live in modules of their own, so their client libraries reach only the
+programs that import them and the core stays free of dependencies.
+
+| Destination | Module | |
+|---|---|---|
+| ClickHouse | `github.com/elqsar/better-batch/clickhouse` | [README](clickhouse/README.md) |
+
 ---
 
 # Observability

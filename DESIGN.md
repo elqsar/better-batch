@@ -490,4 +490,10 @@ weaken the one guarantee the library exists to make. `SyncNever` is the fast mod
    Overflow drops rather than blocks. A queue that blocks when it is full would reinstate
    exactly the problem the option exists to solve, so the events go and `Stats().ObserverDropped`
    counts them: a hook too slow to keep up costs metrics, never throughput or records.
-6. Sinks worth shipping: ClickHouse, Kafka, OTLP, plus `func` adapters. ← next
+6. Sinks worth shipping: ClickHouse, Kafka, OTLP, plus `func` adapters. ← in progress
+
+   Each connector is a nested module (`clickhouse/`, later `kafka/`, `otlp/`) with its own
+   go.mod and tags (`clickhouse/v0.1.0`), so the core keeps its no-dependency promise and a
+   caller fetches only the drivers it uses. The connector's go.mod requires a published core
+   tag; local development and CI use an uncommitted `go.work` to build it against the core
+   in the same checkout. ClickHouse is done, on clickhouse-go/v2.

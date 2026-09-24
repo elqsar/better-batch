@@ -1,0 +1,57 @@
+version: '3'
+
+silent: true
+
+tasks:
+  default:
+    desc: List the tasks
+    cmds:
+      - task --list
+
+  work:
+    desc: Create the go.work joining the core and connector modules (uncommitted)
+    status:
+      - test -f go.work
+    cmds:
+      - go work init . ./clickhouse
+
+  test:
+    desc: Vet and test the core module with the race detector
+    cmds:
+      - go vet ./...
+      - go test -race ./... {{.CLI_ARGS}}
+
+  lint:
+    desc: Run the pinned staticcheck and govulncheck over every module
+    cmds:
+      - for: [., ./clickhouse]
+        cmd: |
+          cd {{.ITEM}}
+          go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  ch:up:
+    desc: Start a throwaway ClickHouse in podman for the connector's integration tests
+    dir: clickhouse
+    cmds:
+      - podman-compose -f compose.yaml up -d
+      - |
+        for i in $(seq 1 60); do
+          podman-compose -f compose.yaml exec -T clickhouse clickhouse-client -u test --password test -q 'SELECT 1' >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        echo "ClickHouse did not come up" >&2; exit 1
+
+  ch:down:
+    desc: Stop and remove the ClickHouse container
+    dir: clickhouse
+    cmds:
+      - podman-compose -f compose.yaml down
+
+  ch:test:
+    desc: Vet and test the ClickHouse connector, integration tests included (needs ch:up)
+    deps: [work]
+    dir: clickhouse
+    cmds:
+      - go vet -tags integration ./...
+      - go test -race -tags integration -count=1 ./... {{.CLI_ARGS}}

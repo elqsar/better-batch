@@ -72,3 +72,54 @@ jobs:
 
       - name: Fuzz recovery
         run: go test -run '^$' -fuzz '^FuzzRecover$' -fuzztime 30s ./internal/wal
+
+  clickhouse:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_USER: test
+          CLICKHOUSE_PASSWORD: test
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "clickhouse-client -u test --password test -q 'SELECT 1'"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    defaults:
+      run:
+        working-directory: clickhouse
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: clickhouse/go.sum
+
+      # The connector's go.mod names a published core release; this is what a
+      # caller running go get resolves, so it has to build on its own.
+      - name: Build against the published core
+        env:
+          GOWORK: 'off'
+        run: go build ./...
+
+      # From here on, against the core in this checkout, so a core change that
+      # breaks the connector fails the pull request that makes it.
+      - name: Join the modules
+        run: go work init .. .
+
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        run: go vet -tags integration ./...
+
+      - name: Test, integration included
+        run: go test -race -tags integration ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
