@@ -207,7 +207,11 @@ Record framing, little-endian:
 - CRC covers the length field *and* the payload, so a corrupt length is caught.
 - LSNs are implicit: `segment.baseLSN + index`. Saves 8 bytes per record, and on open the
   segment chain is verified (`seg[i+1].baseLSN == seg[i].baseLSN + seg[i].count`) so a
-  missing or truncated middle segment is detected rather than silently shifting LSNs.
+  missing or truncated middle segment is detected rather than silently shifting LSNs. The
+  head has nothing in front of it to check, so `Open` compares the link it records against
+  the checkpoint instead: segments are only deleted once a checkpoint covering them is
+  durable, so a head that follows an LSN above the checkpoint means undelivered segments
+  went missing, and `Open` refuses.
 - `MaxSegmentBytes` is a **soft** limit: rotation happens between commit rounds, never
   mid-record, so a segment may overshoot by up to one commit batch.
 

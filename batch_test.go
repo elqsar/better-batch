@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/elqsar/better-batch/internal/wal"
 )
 
 type stringCodec struct{}
@@ -2112,6 +2114,49 @@ func TestClassifierDoesNotRunOnShutdownCancellation(t *testing.T) {
 	}
 }
 
+// The handler must not even be asked about an error Close caused, on either
+// sink. Its answer would be discarded, but the call itself can block the
+// shutdown, panic, or count a rejection that never happened.
+func TestClassifierIsNotCalledForShutdownCancellation(t *testing.T) {
+	for _, deadLetter := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadLetter=%v", deadLetter), func(t *testing.T) {
+			blocked := &recorder{}
+			blocked.delay.Store(int64(time.Hour)) // blocks until its context is cancelled
+			sink, dlq := Sink[string](blocked), &recorder{}
+			if deadLetter {
+				// The primary rejects outright, so the batch reaches the
+				// dead-letter sink, and that is the one left blocked.
+				rejecting := &recorder{}
+				rejecting.fail(ErrPermanent)
+				sink, dlq = rejecting, blocked
+			}
+			var calls atomic.Int64
+			b := openBuf(t, t.TempDir(), sink, fast(
+				WithDeadLetter[string](dlq),
+				WithOnSinkError(func(f SinkFailure) RetryDecision {
+					if f.DeadLetter == deadLetter {
+						calls.Add(1)
+					}
+					return RetryDecision{Action: DeadLetterBatch}
+				}),
+			)...)
+			if err := b.Write(context.Background(), "x"); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, 5*time.Second, func() bool { return blocked.calls() > 0 })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			if err := b.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Close = %v, want the deadline and nothing else", err)
+			}
+			if n := calls.Load(); n != 0 {
+				t.Fatalf("handler called %d times for the shutdown's own cancellation, want 0", n)
+			}
+		})
+	}
+}
+
 func TestDeadLetterSinkClassification(t *testing.T) {
 	// A dead-letter sink that rejects permanently has nowhere further to send
 	// the batch, so the verdict means give up now rather than work through the
@@ -2327,4 +2372,107 @@ func TestSalvageLetsADamagedBufferDeliverTheRest(t *testing.T) {
 	if delivered >= total {
 		t.Fatalf("delivered %d of %d records, so nothing was cut", delivered, total)
 	}
+}
+
+// A segment at the head of the log that disappears without having been
+// delivered — deleted by hand, or left out of a restore — takes its records with
+// it. Recovery checks every link between the segments that remain, so only the
+// first one's link is left to compare against the checkpoint, and Open has to
+// refuse rather than step over what that segment held.
+func TestOpenRefusesAMissingHeadSegment(t *testing.T) {
+	dir := t.TempDir()
+	down := &recorder{}
+	down.failAll.Store(true)
+	b := openBuf(t, dir, down, fast(WithSegmentBytes(1))...)
+	for _, s := range []string{"a", "b", "c"} {
+		if err := b.Write(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = b.Close(ctx)
+
+	segs, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	slices.Sort(segs)
+	if len(segs) < 2 {
+		t.Fatalf("need at least 2 segments, got %d", len(segs))
+	}
+	aside := filepath.Join(t.TempDir(), filepath.Base(segs[0]))
+	if err := os.Rename(segs[0], aside); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open[string](dir, &recorder{}, stringCodec{}, fast()...); !errors.Is(err, wal.ErrCorrupt) {
+		t.Fatalf("Open with the head segment missing = %v, want ErrCorrupt", err)
+	}
+
+	// The refusal must leave the directory as it found it, so putting the
+	// segment back recovers every record.
+	if err := os.Rename(aside, segs[0]); err != nil {
+		t.Fatal(err)
+	}
+	up := &recorder{}
+	b2 := openBuf(t, dir, up, fast()...)
+	closeBuf(t, b2)
+	if got := up.seen(); !slices.Equal(got, []string{"a", "b", "c"}) {
+		t.Fatalf("delivered %q after restoring the segment, want [a b c]", got)
+	}
+}
+
+// The check must not mistake ordinary truncation for loss: segments deleted
+// after their records were delivered leave a head that follows the checkpoint.
+func TestOpenAcceptsAHeadTruncatedByDelivery(t *testing.T) {
+	dir := t.TempDir()
+	sink := &recorder{}
+	b := openBuf(t, dir, sink, fast(WithSegmentBytes(1))...)
+	for i := range 10 {
+		if err := b.Write(context.Background(), fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeBuf(t, b)
+	if segs, _ := filepath.Glob(filepath.Join(dir, "*.log")); len(segs) != 1 {
+		t.Fatalf("%d segments left after delivering everything, want 1", len(segs))
+	}
+	closeBuf(t, openBuf(t, dir, &recorder{}, fast()...))
+}
+
+// Open raises the mark past an empty head segment and the gap in front of it,
+// and the truncation that follows deletes that segment. The raised mark has to
+// be persisted first: the buffer only rewrites the checkpoint when it moves, so
+// otherwise the file keeps the old value, and the next Open finds a head that
+// follows something above it and refuses a log that lost nothing.
+func TestRaisedCheckpointIsPersistedBeforeTheHeadGoes(t *testing.T) {
+	dir := t.TempDir()
+	reserve := func(lsn int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "RESERVED"), fmt.Appendf(nil, "%d\n", lsn), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := fast(WithCheckpointInterval(time.Hour))
+
+	b := openBuf(t, dir, &recorder{}, opts...)
+	for _, s := range []string{"a", "b", "c"} {
+		if err := b.Write(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeBuf(t, b) // checkpoint 3
+
+	// Each reopen above the reservation starts an empty segment past a gap:
+	// first one following LSN 3, then one following the first.
+	reserve(9)
+	closeBuf(t, openBuf(t, dir, &recorder{}, opts...))
+	reserve(19)
+	closeBuf(t, openBuf(t, dir, &recorder{}, opts...))
+
+	cp, err := wal.ReadCheckpoint(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cp < 9 {
+		t.Fatalf("checkpoint = %d after the empty head was deleted, want at least 9", cp)
+	}
+	closeBuf(t, openBuf(t, dir, &recorder{}, opts...))
 }

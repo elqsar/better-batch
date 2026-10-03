@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -581,4 +582,98 @@ func TestObserverOptionsAreLastOneWins(t *testing.T) {
 		t.Fatal("WithObserver did not turn the dispatcher back off")
 	}
 	closeBuf(t, b)
+}
+
+// An asynchronous hook may call Close while another goroutine is already
+// closing. The hook's call waits for that shutdown, so the shutdown must not in
+// turn wait for the hook.
+func TestAsyncHookMayCloseDuringAnotherClose(t *testing.T) {
+	var b *Buffer[string]
+	inHook := make(chan struct{})
+	hookErr := make(chan error, 1)
+	var once sync.Once
+	obs := Observer{OnCheckpoint: func(uint64) {
+		once.Do(func() {
+			close(inHook)
+			// Hold the hook until the outer Close has sealed the buffer, so the
+			// two calls are guaranteed to overlap.
+			for {
+				b.mu.Lock()
+				sealed := b.sealed
+				b.mu.Unlock()
+				if sealed {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			hookErr <- b.Close(context.Background())
+		})
+	}}
+	b = openBuf(t, t.TempDir(), &recorder{}, fast(WithAsyncObserver(obs, 64))...)
+	if err := b.Write(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+	<-inHook
+
+	closed := make(chan error, 1)
+	go func() { closed <- b.Close(context.Background()) }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close deadlocked against a hook calling Close")
+	}
+	if err := <-hookErr; err != nil {
+		t.Fatalf("Close from the hook: %v", err)
+	}
+}
+
+// When the hook itself is the first to call Close, the dispatcher that Close
+// would wait for is the goroutine making the call.
+func TestAsyncHookMayCloseTheBuffer(t *testing.T) {
+	var b *Buffer[string]
+	hookErr := make(chan error, 1)
+	var once sync.Once
+	obs := Observer{OnCheckpoint: func(uint64) {
+		once.Do(func() { hookErr <- b.Close(context.Background()) })
+	}}
+	b = openBuf(t, t.TempDir(), &recorder{}, fast(WithAsyncObserver(obs, 64))...)
+	if err := b.Write(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-hookErr:
+		if err != nil {
+			t.Fatalf("Close from the hook: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close called from a hook waited on its own goroutine")
+	}
+	select {
+	case <-b.obs.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dispatcher did not drain after the hook returned")
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("a later Close: %v", err)
+	}
+}
+
+func TestInDispatcherIdentifiesTheHookGoroutine(t *testing.T) {
+	if !strings.HasSuffix(dispatcherCall, ".(*dispatcher).call") {
+		t.Fatalf("dispatcherCall = %q, want the dispatcher's call method", dispatcherCall)
+	}
+	if inDispatcher() {
+		t.Fatal("inDispatcher is true on the test goroutine")
+	}
+	d := newDispatcher(1)
+	got := make(chan bool, 1)
+	d.post(func() { got <- inDispatcher() })
+	d.stop()
+	<-d.done
+	if !<-got {
+		t.Fatal("inDispatcher is false inside a hook")
+	}
 }

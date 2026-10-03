@@ -209,6 +209,19 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 		log.Close()
 		return nil, err
 	}
+	// Segments are only ever deleted after a checkpoint covering them is
+	// durable, so the first one left must follow something at or below the
+	// mark. If it follows something above, the segments holding the LSNs in
+	// between were removed without being delivered — by hand, or by a restore
+	// that missed files — and starting anyway would skip whatever they held
+	// without a word. Recovery cannot tell records from unused numbers in that
+	// stretch, so it is left to an operator, as damage is.
+	if prev := log.FirstPrevEnd(); prev > checkpoint {
+		log.Close()
+		return nil, fmt.Errorf("%w: first segment follows LSN %d but the checkpoint is %d: segments holding LSNs %d-%d are missing",
+			wal.ErrCorrupt, prev, checkpoint, checkpoint+1, prev)
+	}
+	persisted := checkpoint
 	// The mark has to name a place the log can actually resume from, and it can
 	// arrive outside that range from either end.
 	//
@@ -224,6 +237,16 @@ func Open[T any](dir string, sink Sink[T], codec Codec[T], opts ...Option) (*Buf
 	checkpoint = min(checkpoint, log.DurableLSN())
 	if first := log.FirstLSN(); first > 0 {
 		checkpoint = max(checkpoint, first-1)
+	}
+	// Raising the mark lets the truncate below delete an empty head segment, and
+	// the check above relies on no segment going before a checkpoint that covers
+	// it. Raising it is safe to keep: the stretch up to the head's link is at or
+	// below the old mark, and the rest is a gap that never held a record.
+	if checkpoint > persisted {
+		if err := wal.WriteCheckpoint(dir, checkpoint); err != nil {
+			log.Close()
+			return nil, err
+		}
 	}
 	// Everything at or below the checkpoint is already downstream.
 	if err := log.Truncate(checkpoint + 1); err != nil {

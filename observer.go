@@ -1,6 +1,8 @@
 package batch
 
 import (
+	"reflect"
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -59,7 +61,8 @@ type FlushInfo struct {
 	// give up on the batch, or stop. Without it a rejection and an outage are
 	// the same increment on the same counter, and the two want opposite
 	// responses from whoever is paged. It is RetryBatch and carries no meaning
-	// when Err is nil.
+	// when Err is nil, or when the error came from Close cancelling the attempt:
+	// the batch is left to replay on the next Open and nothing was decided.
 	Action RetryAction
 
 	// Duration is how long the sink call took.
@@ -177,6 +180,37 @@ func (d *dispatcher) call(f func()) {
 }
 
 func (d *dispatcher) stop() { close(d.ch) }
+
+// dispatcherCall is the name of the frame every asynchronous hook runs beneath.
+// It is taken from the method itself rather than spelled out, so a rename or a
+// change of module path cannot quietly turn inDispatcher off.
+var dispatcherCall = runtime.FuncForPC(reflect.ValueOf((*dispatcher).call).Pointer()).Name()
+
+// inDispatcher reports whether the calling goroutine is a dispatcher running a
+// hook. Go has no goroutine identity to compare against, so it looks for the
+// dispatcher's frame on the caller's own stack, which no other goroutine can
+// have. It walks the whole stack, so it belongs on a path as rare as Close.
+func inDispatcher() bool {
+	pcs := make([]uintptr, 64)
+	for {
+		n := runtime.Callers(2, pcs)
+		if n < len(pcs) {
+			pcs = pcs[:n]
+			break
+		}
+		pcs = make([]uintptr, 2*len(pcs))
+	}
+	frames := runtime.CallersFrames(pcs)
+	for {
+		f, more := frames.Next()
+		if f.Function == dispatcherCall {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
 
 // recoverObserver is deferred around a synchronous hook. Most of them run on the
 // buffer's own goroutines — the flusher, a delivery, the checkpointer — where a
