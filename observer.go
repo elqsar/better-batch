@@ -61,7 +61,8 @@ type FlushInfo struct {
 	// give up on the batch, or stop. Without it a rejection and an outage are
 	// the same increment on the same counter, and the two want opposite
 	// responses from whoever is paged. It is RetryBatch and carries no meaning
-	// when Err is nil.
+	// when Err is nil, or when the error came from Close cancelling the attempt:
+	// the batch is left to replay on the next Open and nothing was decided.
 	Action RetryAction
 
 	// Duration is how long the sink call took.

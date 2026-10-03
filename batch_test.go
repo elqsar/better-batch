@@ -2114,6 +2114,49 @@ func TestClassifierDoesNotRunOnShutdownCancellation(t *testing.T) {
 	}
 }
 
+// The handler must not even be asked about an error Close caused, on either
+// sink. Its answer would be discarded, but the call itself can block the
+// shutdown, panic, or count a rejection that never happened.
+func TestClassifierIsNotCalledForShutdownCancellation(t *testing.T) {
+	for _, deadLetter := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadLetter=%v", deadLetter), func(t *testing.T) {
+			blocked := &recorder{}
+			blocked.delay.Store(int64(time.Hour)) // blocks until its context is cancelled
+			sink, dlq := Sink[string](blocked), &recorder{}
+			if deadLetter {
+				// The primary rejects outright, so the batch reaches the
+				// dead-letter sink, and that is the one left blocked.
+				rejecting := &recorder{}
+				rejecting.fail(ErrPermanent)
+				sink, dlq = rejecting, blocked
+			}
+			var calls atomic.Int64
+			b := openBuf(t, t.TempDir(), sink, fast(
+				WithDeadLetter[string](dlq),
+				WithOnSinkError(func(f SinkFailure) RetryDecision {
+					if f.DeadLetter == deadLetter {
+						calls.Add(1)
+					}
+					return RetryDecision{Action: DeadLetterBatch}
+				}),
+			)...)
+			if err := b.Write(context.Background(), "x"); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, 5*time.Second, func() bool { return blocked.calls() > 0 })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			if err := b.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Close = %v, want the deadline and nothing else", err)
+			}
+			if n := calls.Load(); n != 0 {
+				t.Fatalf("handler called %d times for the shutdown's own cancellation, want 0", n)
+			}
+		})
+	}
+}
+
 func TestDeadLetterSinkClassification(t *testing.T) {
 	// A dead-letter sink that rejects permanently has nowhere further to send
 	// the batch, so the verdict means give up now rather than work through the

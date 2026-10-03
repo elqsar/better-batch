@@ -297,13 +297,21 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			b.sinkPanicked(batch, p, attempt, false, started, perr)
 			return
 		}
-		d := b.classify(SinkFailure{
-			ID:      batch.ID,
-			Records: int(p.count),
-			Bytes:   int(p.bytes),
-			Attempt: attempt,
-			Err:     err,
-		})
+		// Close closes abort before it cancels the delivery context, so an
+		// error the cancellation caused always finds aborting already true.
+		// That error is the shutdown talking, not the sink's verdict, and the
+		// handler is not asked about it: it could block the shutdown or act on
+		// an answer the buffer is going to discard.
+		var d RetryDecision
+		if !b.aborting() {
+			d = b.classify(SinkFailure{
+				ID:      batch.ID,
+				Records: int(p.count),
+				Bytes:   int(p.bytes),
+				Attempt: attempt,
+				Err:     err,
+			})
+		}
 		b.observeFlush(FlushInfo{
 			ID:       batch.ID,
 			Records:  int(p.count),
@@ -343,11 +351,11 @@ func (b *Buffer[T]) deliver(batch Batch[T], p pending[T]) {
 			// are not exhausted and the records are not dead letters: leave the
 			// range unacknowledged and let the next open replay it.
 			//
-			// The classification is discarded here rather than acted on, and
-			// the order is the point: a handler shown a cancelled context could
-			// reasonably call it permanent, and disposing of records on that
-			// answer during a shutdown is the same bug as counting one as
-			// retries running out.
+			// A handler shown a cancelled context could reasonably call it
+			// permanent, and disposing of records on that answer during a
+			// shutdown is the same bug as counting one as retries running out.
+			// A genuine error that raced the abort was classified above, and
+			// that answer is discarded here for the same reason.
 			return
 		}
 
@@ -476,14 +484,17 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 			b.sinkPanicked(batch, p, attempt, true, started, perr)
 			return
 		}
-		d := b.classify(SinkFailure{
-			ID:         batch.ID,
-			Records:    int(p.count),
-			Bytes:      int(p.bytes),
-			Attempt:    attempt,
-			DeadLetter: true,
-			Err:        err,
-		})
+		var d RetryDecision
+		if !b.aborting() { // as in deliver: shutdown errors are not classified
+			d = b.classify(SinkFailure{
+				ID:         batch.ID,
+				Records:    int(p.count),
+				Bytes:      int(p.bytes),
+				Attempt:    attempt,
+				DeadLetter: true,
+				Err:        err,
+			})
+		}
 		b.observeFlush(FlushInfo{
 			ID:         batch.ID,
 			Records:    int(p.count),
@@ -505,8 +516,8 @@ func (b *Buffer[T]) deadLetter(batch Batch[T], p pending[T]) {
 			// The dead-letter sink was cancelled by the shutdown, exactly as the
 			// primary one can be. The records have reached neither, so they are
 			// not dead letters yet: leave the range unacknowledged and let the
-			// next open replay it. The classification is discarded for the same
-			// reason it is in deliver.
+			// next open replay it. As in deliver, any classification is
+			// discarded.
 			return
 		}
 
