@@ -705,7 +705,11 @@ func (b *Buffer[T]) Flush(ctx context.Context) error {
 // If ctx expires first, Close stops waiting and returns its error. Nothing is
 // lost: unacknowledged records stay in the log and are replayed on the next
 // Open. A sink that ignores its context can still stall shutdown.
+//
+// Called from a WithAsyncObserver hook, Close does not wait for the hooks queued
+// behind that one: they run on the goroutine making the call, after it returns.
 func (b *Buffer[T]) Close(ctx context.Context) error {
+	closer := false
 	b.closeOnce.Do(func() {
 		b.mu.Lock()
 		b.sealed = true
@@ -744,18 +748,11 @@ func (b *Buffer[T]) Close(ctx context.Context) error {
 		<-b.cpDone
 		b.persist()
 
-		// The dispatcher outlives the final persist, so that last checkpoint is
-		// still reported. This wait is bounded by ctx where the ones above it are
-		// not, and the asymmetry is the point: abandoning a dispatcher goroutine
-		// costs a leaked goroutine and some metrics, while closing the log out
-		// from under the flusher would cost records. A hook wedged here does not
-		// fail the Close either — everything is already durable by now.
+		// No event can be raised past this point, so the dispatcher is told to
+		// finish what it has queued; it outlives the final persist, so that last
+		// checkpoint is still reported.
 		if b.obs != nil {
 			b.obs.stop()
-			select {
-			case <-b.obs.done:
-			case <-ctx.Done():
-			}
 		}
 
 		err := b.log.Close()
@@ -766,7 +763,28 @@ func (b *Buffer[T]) Close(ctx context.Context) error {
 			err = ferr
 		}
 		b.closeErr = err
+		closer = true
 	})
+
+	// The dispatcher is waited for outside closeOnce, and only by the call that
+	// did the shutdown. An asynchronous hook may call Close, and if it does while
+	// another goroutine is shutting down, it blocks in closeOnce.Do: waiting for
+	// the dispatcher inside Do would be waiting on a hook that is waiting on us.
+	// When the hook is the one shutting down, the dispatcher it would wait for is
+	// its own goroutine, so it does not wait at all; the queue drains once it
+	// returns.
+	//
+	// This wait is bounded by ctx where the ones above it are not, and the
+	// asymmetry is the point: abandoning a dispatcher goroutine costs a leaked
+	// goroutine and some metrics, while closing the log out from under the
+	// flusher would cost records. A hook wedged here does not fail the Close
+	// either — everything is already durable by now.
+	if closer && b.obs != nil && !inDispatcher() {
+		select {
+		case <-b.obs.done:
+		case <-ctx.Done():
+		}
+	}
 	// closeOnce.Do happens-before every later Do return, so closeErr is safe to
 	// read here and repeated calls report the first outcome instead of nil.
 	return b.closeErr
