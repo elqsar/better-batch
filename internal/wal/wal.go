@@ -759,6 +759,17 @@ func (l *Log) FirstLSN() uint64 {
 	return l.firstLSN
 }
 
+// FirstPrevEnd returns the last LSN of the segment that preceded the first one
+// still on disk, as recorded when that first segment was created. Recovery
+// checks every later link itself, but only the caller knows what the head is
+// supposed to follow: a checkpoint below this value means the segments that
+// held the LSNs in between are gone without having been delivered.
+func (l *Log) FirstPrevEnd() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segs[0].prevEnd
+}
+
 // Close drains staged records, syncs, and releases the directory lock.
 func (l *Log) Close() error {
 	l.mu.Lock()
