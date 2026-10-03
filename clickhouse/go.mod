@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
-	github.com/elqsar/better-batch v0.5.0
+	github.com/elqsar/better-batch v0.6.0
 )
 
 require (
