@@ -70,17 +70,17 @@ batch goes somewhere you can inspect.
 
 The buffer delivers at least once, so a batch whose insert succeeded but whose
 acknowledgement was lost is sent again. `WithDeduplication(scope)` sets
-`insert_deduplication_token` to the scope plus the batch's range of record numbers, and the
-server drops the repeat.
+`insert_deduplication_token` to the scope, the batch's `LogID` and its range of record
+numbers, and the server drops the repeat.
 
 - The table must deduplicate inserts: `Replicated*MergeTree` does by default; a plain
   `MergeTree` needs `SETTINGS non_replicated_deduplication_window = N`.
-- The scope must be unique among the buffers writing to the table, and must change if a
-  buffer's directory is deleted and recreated. Record numbers are unique only within one
-  directory; a reused token makes the server discard records it has never seen.
+- Record numbers restart at 1 in a new directory, but `LogID` is random per directory and
+  replaced when one is recreated, so tokens never collide across buffers or across a
+  deleted directory. The scope can be empty; it only makes tokens easier to recognise.
 - A batch regrouped after a restart covers a different range and is inserted again.
   Deduplication narrows the window for duplicates, it does not close it. For exact
-  deduplication, store `b.ID + i` in a column and use a `ReplacingMergeTree` keyed on it.
+  deduplication, store `b.LogID` and `b.ID + i` in columns and use a `ReplacingMergeTree` keyed on them.
 
 ## Development
 
