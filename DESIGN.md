@@ -63,6 +63,13 @@ No exactly-once. Instead, every batch carries a stable monotonic `Batch.ID` (the
 first record) so a sink with idempotency keys or a transactional destination can dedupe on
 its own side and get effectively-once. Honest, and actually usable.
 
+> As built, the LSN alone turned out to be half a key. Numbering starts at 1 in every new
+> directory, so a destination that outlives one — or a directory recreated under the same
+> path — would see the same numbers name different records. `Batch.LogID` is the other
+> half: a random identity stored in `LOGID`, replaced whenever the log starts numbering
+> from nothing (no segment and no reservation), so a stale file left in an emptied
+> directory cannot carry over.
+
 **Durability — configurable.** `SyncAlways` / `SyncInterval(d)` / `SyncNever`. Default is
 `SyncInterval(5ms)`: a bounded, documented loss window instead of a vague one.
 
@@ -194,6 +201,8 @@ dir/
   00000000000000000001.log segment, named by base LSN
   00000000000000065537.log
   CHECKPOINT               last LSN successfully flushed to the sink
+  RESERVED                 highest LSN claimed, so a number is never handed out twice
+  LOGID                    random identity of this numbering, exposed as Batch.LogID
 ```
 
 Record framing, little-endian:

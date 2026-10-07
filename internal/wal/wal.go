@@ -164,6 +164,7 @@ type Log struct {
 	nextLSN  uint64 // LSN the next appended record will get
 	firstLSN uint64 // lowest LSN still on disk
 	reserved uint64 // highest LSN durably claimed, never handed out twice
+	id       string // names the numbering; see loadIdentity
 
 	pending    []byte // records staged for the next commit round
 	spare      []byte // buffer handed back by the committer, reused for staging
@@ -250,6 +251,12 @@ func (l *Log) recover() error {
 		return err
 	}
 	l.reserved = reserved
+
+	// With no segment and no reservation, nothing can have been numbered: the
+	// log is about to start from LSN 1, so it starts under a new identity.
+	if l.id, err = loadIdentity(l.dir, len(names) == 0 && reserved == 0); err != nil {
+		return err
+	}
 
 	for i, n := range names {
 		path := filepath.Join(l.dir, segmentName(n.base, n.prevEnd))
@@ -744,6 +751,11 @@ func (l *Log) Truncate(upto uint64) error {
 	}
 	return syncDir(l.dir)
 }
+
+// ID returns the log's identity. It is fixed for as long as the numbering is,
+// and a log that starts numbering from LSN 1 again gets a new one, so an
+// (ID, LSN) pair names one record across every log there has ever been.
+func (l *Log) ID() string { return l.id }
 
 // DurableLSN returns the highest LSN that has completed a commit round.
 func (l *Log) DurableLSN() uint64 {

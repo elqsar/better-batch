@@ -23,6 +23,14 @@ type Batch[T any] struct {
 	// the second time.
 	ID uint64
 
+	// LogID names the numbering ID belongs to. It is random, fixed for the life
+	// of the buffer directory, and replaced when the directory starts over from
+	// nothing — deleted and recreated, or emptied — because its numbering then
+	// restarts at 1 and would reuse IDs for different records. Use LogID and
+	// ID+i together as the key when the destination outlives the directory or
+	// is shared with other buffers.
+	LogID string
+
 	// Records are the decoded events, in the order they were written.
 	Records []T
 

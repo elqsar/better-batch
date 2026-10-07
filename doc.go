@@ -7,8 +7,10 @@
 // size, or time, and delivers them to a [Sink]. Records are released — and
 // their log space reclaimed — only after the sink acknowledges them, giving
 // at-least-once delivery across process crashes. Records in a batch are
-// consecutive and numbered from [Batch.ID], and a number is never reused, so a
-// sink that treats ID+i as an idempotency key gets effectively-once delivery.
+// consecutive and numbered from [Batch.ID], a number is never reused, and
+// [Batch.LogID] tells the numbering apart from that of any other directory, so
+// a sink that treats (LogID, ID+i) as an idempotency key gets effectively-once
+// delivery.
 //
 // Backpressure is pluggable through the [Policy] interface: block, reject,
 // drop newest, drop oldest, or block with a deadline and then shed. A full

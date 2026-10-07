@@ -85,17 +85,23 @@ points replays the batch.
 There is no exactly-once mode, because it isn't achievable without the sink's cooperation.
 What you get instead is a stable identity per **record**: `Batch.ID` is the log sequence
 number of the batch's first record, and a batch always holds consecutive records, so
-record `i` is `b.ID + i`. That number names one record for the life of the buffer — across
-retries, across restarts, and across a crash that loses the log's tail. Give a sink with
-idempotency keys or a transactional destination those numbers and you get
-effectively-once:
+record `i` is `b.ID + i`. That number names one record for the life of the buffer
+directory — across retries, across restarts, and across a crash that loses the log's tail.
+
+The numbering starts at 1 in every new directory, so the number alone is not enough once
+the destination outlives the directory or is shared with other buffers. `Batch.LogID`
+covers that: a random identity, fixed while the numbering is, and replaced when the
+directory starts over from nothing — deleted and recreated, or emptied. Together the two
+name one record anywhere. Give a sink with idempotency keys or a transactional destination
+that pair and you get effectively-once:
 
 ```go
 sink := batch.SinkFunc[Event](func(ctx context.Context, b batch.Batch[Event]) error {
     rows := make([]Row, len(b.Records))
     for i, e := range b.Records {
-        // Same key on every retry and after a crash, so the destination can dedupe.
-        rows[i] = Row{Key: b.ID + uint64(i), Event: e}
+        // Same key on every retry and after a crash, so the destination can dedupe,
+        // and a different one if the directory is ever recreated.
+        rows[i] = Row{Log: b.LogID, Seq: b.ID + uint64(i), Event: e}
     }
     return db.InsertIdempotent(ctx, rows)
 })
