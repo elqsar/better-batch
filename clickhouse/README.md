@@ -55,7 +55,7 @@ thousands of records or several megabytes, not by hundreds.
 |---|---|---|
 | A value the driver cannot convert to its column type | wraps `batch.ErrPermanent` | dead-lettered |
 | The server rejects the data (type mismatch, parse error, constraint) | wraps `batch.ErrPermanent` | dead-lettered |
-| Bad credentials, unknown database, table or column | the driver's error | buffer stops, backlog kept |
+| Bad credentials, unknown database, table or column, a table name that does not parse | the driver's error | buffer stops, backlog kept |
 | The row function returns the wrong number of values | a shape error | buffer stops, backlog kept |
 | Anything else: network, timeouts, too many parts | the driver's error | retried on the ladder |
 

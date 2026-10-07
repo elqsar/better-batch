@@ -141,6 +141,7 @@ func TestServerErrors(t *testing.T) {
 		{"type mismatch on send", false, 53, true, batch.DeadLetterBatch},
 		{"unknown table on prepare", true, 60, false, batch.FailBuffer},
 		{"auth failure on prepare", true, 516, false, batch.FailBuffer},
+		{"malformed table name on prepare", true, 62, false, batch.FailBuffer},
 		{"too many parts on send", false, 252, false, batch.RetryBatch},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

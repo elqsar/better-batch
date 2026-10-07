@@ -148,6 +148,17 @@ func TestIntegrationMisdirectedFailsBuffer(t *testing.T) {
 		t.Errorf("unknown table: Classify = %v, want fail (err %v)", got.Action, err)
 	}
 
+	// The table is used as written, so a name that does not parse reaches the
+	// server as a malformed query.
+	s, err = New(good, "no such table", []string{"id", "name"}, eventRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.Flush(context.Background(), b)
+	if got := Classify(batch.SinkFailure{Err: err}); got.Action != batch.FailBuffer {
+		t.Errorf("malformed table name: Classify = %v, want fail (err %v)", got.Action, err)
+	}
+
 	bad := connect(t, "wrong-"+password())
 	s, err = New(bad, "anything", []string{"id", "name"}, eventRow)
 	if err != nil {

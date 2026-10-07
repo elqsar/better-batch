@@ -30,6 +30,7 @@ var (
 	}
 	misdirected = map[int32]bool{
 		16:  true, // NO_SUCH_COLUMN_IN_TABLE
+		62:  true, // SYNTAX_ERROR: the query is built once, so a table name that does not parse fails every batch
 		60:  true, // UNKNOWN_TABLE
 		81:  true, // UNKNOWN_DATABASE
 		192: true, // UNKNOWN_USER
@@ -57,7 +58,8 @@ func exceptionCode(err error) (int32, bool) {
 
 // Classify is a handler for batch.WithOnSinkError. It stops the buffer, with
 // the backlog kept, when ClickHouse says the destination is wrong — bad
-// credentials, no such database, table or column — or the row function
+// credentials, no such database, table or column, a table name that does not
+// parse — or the row function
 // returns the wrong number of values. Without it those are retried on the
 // configured ladder, which is safe but never gets anywhere.
 //
