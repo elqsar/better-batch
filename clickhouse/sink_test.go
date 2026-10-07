@@ -168,12 +168,22 @@ func TestServerErrors(t *testing.T) {
 
 func TestDeduplicationToken(t *testing.T) {
 	s := newSink(t, &fakeConn{}, WithDeduplication("ingest-1"), WithSettings(ch.Settings{"async_insert": 1}))
-	got := s.settings(batch.Batch[event]{ID: 10, Records: make([]event, 3)})
-	if got["insert_deduplication_token"] != "ingest-1:10-12" || got["async_insert"] != 1 {
+	got := s.settings(batch.Batch[event]{ID: 10, LogID: "L1", Records: make([]event, 3)})
+	if got["insert_deduplication_token"] != "ingest-1:L1:10-12" || got["async_insert"] != 1 {
 		t.Errorf("settings = %v", got)
+	}
+	// The same range under another numbering is a different set of records.
+	other := s.settings(batch.Batch[event]{ID: 10, LogID: "L2", Records: make([]event, 3)})
+	if other["insert_deduplication_token"] == got["insert_deduplication_token"] {
+		t.Errorf("batches from two logs share the token %v", got["insert_deduplication_token"])
 	}
 	if _, leaked := s.cfg.settings["insert_deduplication_token"]; leaked {
 		t.Error("token written into the shared settings map")
+	}
+
+	unscoped := newSink(t, &fakeConn{}, WithDeduplication(""))
+	if got := unscoped.settings(batch.Batch[event]{ID: 1, LogID: "L1", Records: make([]event, 1)}); got["insert_deduplication_token"] != ":L1:1-1" {
+		t.Errorf("empty scope: settings = %v, want deduplication still on", got)
 	}
 
 	plain := newSink(t, &fakeConn{})

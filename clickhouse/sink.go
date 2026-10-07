@@ -46,6 +46,7 @@ type Conn interface {
 type Option func(*config)
 
 type config struct {
+	dedup    bool
 	scope    string
 	settings ch.Settings
 }
@@ -54,19 +55,18 @@ type config struct {
 // batch retried after an insert that succeeded but whose acknowledgement was
 // lost is dropped by the server rather than stored twice.
 //
-// The token is scope plus the range of log sequence numbers in the batch.
-// Those numbers are only unique within one buffer directory, and ClickHouse
-// deduplicates per table, so scope must be unique among the buffers writing
-// to the table, and must change if a buffer's directory is deleted and
-// recreated: its numbering starts over, and a reused token makes the server
-// silently discard records it has never seen.
+// The token is scope, the batch's LogID and the range of log sequence numbers
+// in the batch. LogID is random per buffer directory and replaced when the
+// directory starts over, so tokens from different buffers, or from a directory
+// deleted and recreated, never collide; scope may be empty, and is there only
+// to make tokens easier to recognise on the server.
 //
 // The table must deduplicate inserts: Replicated*MergeTree does by default, a
 // plain MergeTree needs non_replicated_deduplication_window set. A batch
 // regrouped after a restart has a different range, so it is inserted again;
 // deduplication narrows the window for duplicates, it does not close it.
 func WithDeduplication(scope string) Option {
-	return func(c *config) { c.scope = scope }
+	return func(c *config) { c.dedup, c.scope = true, scope }
 }
 
 // WithSettings sends ClickHouse settings with every insert, for example
@@ -160,12 +160,12 @@ func (s *Sink[T]) Flush(ctx context.Context, b batch.Batch[T]) error {
 // It builds a fresh map each time, since concurrent flushes carry different
 // tokens.
 func (s *Sink[T]) settings(b batch.Batch[T]) ch.Settings {
-	if s.cfg.scope == "" {
+	if !s.cfg.dedup {
 		return s.cfg.settings
 	}
 	m := make(ch.Settings, len(s.cfg.settings)+1)
 	maps.Copy(m, s.cfg.settings)
 	last := b.ID + uint64(len(b.Records)) - 1
-	m["insert_deduplication_token"] = fmt.Sprintf("%s:%d-%d", s.cfg.scope, b.ID, last)
+	m["insert_deduplication_token"] = fmt.Sprintf("%s:%s:%d-%d", s.cfg.scope, b.LogID, b.ID, last)
 	return m
 }

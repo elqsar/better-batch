@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -116,6 +117,39 @@ func TestIntegrationDeduplication(t *testing.T) {
 	}
 	if n := count(t, conn, tbl); n != 7 {
 		t.Errorf("after a regrouped batch the table holds %d rows, want 7", n)
+	}
+}
+
+// The footgun LogID removes: a buffer directory deleted and recreated numbers
+// from 1 again. Under the same scope its first batch used to carry the token
+// of the old directory's first batch, and the server dropped it unseen.
+func TestIntegrationRecreatedDirectoryIsNotDeduplicatedAway(t *testing.T) {
+	conn := connect(t, password())
+	tbl := table(t, conn)
+	s, err := New(conn, tbl, []string{"id", "name"}, eventRow, WithDeduplication("it"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "buf")
+	for round := range 2 {
+		buf, err := batch.Open[event](dir, s, batch.JSONCodec[event]{},
+			batch.WithFlush(3, 0, 50*time.Millisecond), batch.WithOnSinkError(Classify))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := buf.WriteBatch(ctx, event{uint64(3 * round), "a"}, event{uint64(3*round + 1), "b"}, event{uint64(3*round + 2), "c"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := buf.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := count(t, conn, tbl); n != 6 {
+		t.Errorf("table holds %d rows, want 6: the recreated directory's batch was taken for the old one", n)
 	}
 }
 
