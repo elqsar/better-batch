@@ -252,6 +252,71 @@ func TestBatchIDIsStableAcrossRetries(t *testing.T) {
 	}
 }
 
+// A sink deduplicating on ID alone breaks when the directory starts over and
+// numbers from 1 again. LogID is what tells the two numberings apart, so it
+// must hold across retries and restarts and change exactly when IDs restart.
+func TestLogIDNamesTheNumbering(t *testing.T) {
+	type seen struct {
+		log string
+		id  uint64
+	}
+	var mu sync.Mutex
+	var got []seen
+	fail := 2
+	sink := SinkFunc[string](func(_ context.Context, b Batch[string]) error {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, seen{b.LogID, b.ID})
+		if len(got) <= fail {
+			return errSink
+		}
+		return nil
+	})
+	deliver := func(dir, v string) {
+		t.Helper()
+		b := openBuf(t, dir, sink, fast(WithRetry(Backoff{Initial: time.Millisecond, Jitter: 0}, 0))...)
+		if err := b.Write(context.Background(), v); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := b.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		closeBuf(t, b)
+	}
+
+	dir := filepath.Join(t.TempDir(), "buf")
+	deliver(dir, "a") // two failures, then delivered
+	deliver(dir, "b") // a restart: same numbering
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	deliver(dir, "c") // recreated: numbering starts over
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 5 {
+		t.Fatalf("sink saw %d batches, want 5: %v", len(got), got)
+	}
+	first := got[0].log
+	if first == "" {
+		t.Fatal("batch has no LogID")
+	}
+	for i, g := range got[:4] {
+		if g.log != first {
+			t.Fatalf("batch %d had LogID %q, want %q: retries and restarts keep the numbering", i, g.log, first)
+		}
+	}
+	last := got[4]
+	if last.id != got[0].id {
+		t.Fatalf("recreated directory numbered from %d, want %d; the test relies on IDs repeating", last.id, got[0].id)
+	}
+	if last.log == first {
+		t.Fatalf("recreated directory reused LogID %q, so (LogID, ID) %v names two records", first, last)
+	}
+}
+
 func TestCheckpointStopsRedelivery(t *testing.T) {
 	dir := t.TempDir()
 	sink := &recorder{}

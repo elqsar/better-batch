@@ -250,7 +250,7 @@ func (b *Buffer[T]) flusher(from uint64) {
 // aborted while waiting, in which case the flusher must stop.
 func (b *Buffer[T]) dispatch(p pending[T]) bool {
 	// The flusher reuses its slice, so the batch handed to the sink is a copy.
-	batch := Batch[T]{ID: p.id, Records: slices.Clone(p.records)}
+	batch := Batch[T]{ID: p.id, LogID: b.log.ID(), Records: slices.Clone(p.records)}
 	p.records = nil
 
 	select {
